@@ -1,40 +1,40 @@
-name: Задача
-description: Одна задача = одна ветка = один PR. По умолчанию её может взять агент.
-title: "<Глагол + что сделать>"
+name: Task
+description: One task = one branch = one pull request. An agent may pick it up by default.
+title: "<Verb + what to do>"
 labels: ["agent"]
 projects: ["verbanium-lab/2"]
 body:
   - type: markdown
     attributes:
       value: |
-        Пишите коротко и проверяемо. Если задачу должен делать человек (консоли, ключи, оплата, решение) —
-        после создания замените метку `agent` на `owner`. Size L агент не берёт: разбейте задачу.
+        Keep it short and verifiable. If a person must do the work (consoles, keys, payments, a decision),
+        replace the `agent` label with `owner` after creating the issue. Agents do not take size L: split it.
   - type: textarea
     id: goal
     attributes:
-      label: Цель
-      description: Зачем это нужно, одним-двумя предложениями.
+      label: Goal
+      description: Why this is needed, in one or two sentences.
     validations:
       required: true
   - type: textarea
     id: scope
     attributes:
-      label: Сделать
-      description: Что именно изменить. Список, без лишнего.
+      label: Scope
+      description: What exactly to change. A short list.
     validations:
       required: true
   - type: textarea
     id: done
     attributes:
-      label: Готово, когда
-      description: Наблюдаемый результат — что можно открыть, запустить или увидеть.
+      label: Done when
+      description: An observable result — something to open, run or see.
     validations:
       required: true
   - type: textarea
     id: verify
     attributes:
-      label: Как проверить
-      description: Команда, ссылка или шаги проверки.
+      label: How to verify
+      description: A command, a link or steps.
     validations:
       required: true
   - type: dropdown
@@ -48,7 +48,7 @@ body:
     id: size
     attributes:
       label: Size
-      description: "S — до 2 часов, M — до дня, L — больше дня (разбить)."
+      description: "S — up to 2 hours, M — up to a day, L — more than a day (split it)."
       options: [S, M, L]
     validations:
       required: true
@@ -56,12 +56,12 @@ body:
     id: risk
     attributes:
       label: Risk
-      description: "high — секреты, доступы, деньги, данные пользователей, workflow, инфраструктура, major-версии."
+      description: "high — secrets, access, money, user data, workflows, infrastructure, major versions."
       options: [low, high]
     validations:
       required: true
   - type: textarea
     id: depends
     attributes:
-      label: Зависит от
-      description: "Ссылки на задачи: #12 или verbanium-lab/verbanium#3. Пусто, если ни от чего."
+      label: Depends on
+      description: "Issue links: #12 or verbanium-lab/verbanium#3. Empty if none."

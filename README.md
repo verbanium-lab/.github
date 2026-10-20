@@ -1,12 +1,12 @@
 # .github
 
-Общие файлы организации `verbanium-lab`: форма задачи, шаблон PR и правила, которые GitHub применяет ко всем
-репозиториям без своих файлов.
+Organization-wide files for `verbanium-lab`: the task form, the pull request template and other defaults that
+GitHub applies to every repository without its own copy.
 
-| Файл | Что делает |
+| File | Purpose |
 | --- | --- |
-| `.github/ISSUE_TEMPLATE/task.yml` | Форма «Задача»: цель, что сделать, готово когда, как проверить, Product, Size, Risk. Ставит метку `agent` и добавляет задачу в Project 2 |
-| `.github/ISSUE_TEMPLATE/config.yml` | Запрещает пустые issue |
-| `.github/pull_request_template.md` | Шаблон PR: `Closes #N`, что сделано, как проверено |
+| `.github/ISSUE_TEMPLATE/task.yml` | "Task" form: goal, scope, done when, how to verify, product, size, risk. Adds the `agent` label and Project 2 |
+| `.github/ISSUE_TEMPLATE/config.yml` | Disables blank issues |
+| `.github/pull_request_template.md` | PR template: `Closes #N`, what changed, how it was verified |
 
-GitHub применяет эти файлы к другим репозиториям организации, только если репозиторий `.github` публичный.
+GitHub applies these defaults to other repositories only while the `.github` repository is public.
