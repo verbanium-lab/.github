@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Целевая архитектура и правила
+  - name: Target architecture and rules
     url: https://github.com/verbanium-lab/verbanium
-    about: Принципы, имена, проверки и процесс работы с задачами.
+    about: Principles, names, checks and the task workflow.
