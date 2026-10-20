@@ -1,13 +1,13 @@
 Closes #
 
-## Что сделано
+## What changed
 
 -
 
-## Как проверено
+## How it was verified
 
 -
 
-## Что нужно от владельца
+## Owner actions
 
-Ничего.
+None.
