@@ -1,0 +1,67 @@
+name: Задача
+description: Одна задача = одна ветка = один PR. По умолчанию её может взять агент.
+title: "<Глагол + что сделать>"
+labels: ["agent"]
+projects: ["verbanium-lab/2"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Пишите коротко и проверяемо. Если задачу должен делать человек (консоли, ключи, оплата, решение) —
+        после создания замените метку `agent` на `owner`. Size L агент не берёт: разбейте задачу.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Цель
+      description: Зачем это нужно, одним-двумя предложениями.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Сделать
+      description: Что именно изменить. Список, без лишнего.
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Готово, когда
+      description: Наблюдаемый результат — что можно открыть, запустить или увидеть.
+    validations:
+      required: true
+  - type: textarea
+    id: verify
+    attributes:
+      label: Как проверить
+      description: Команда, ссылка или шаги проверки.
+    validations:
+      required: true
+  - type: dropdown
+    id: product
+    attributes:
+      label: Product
+      options: [iblonda, tower, verbanium, platform]
+    validations:
+      required: true
+  - type: dropdown
+    id: size
+    attributes:
+      label: Size
+      description: "S — до 2 часов, M — до дня, L — больше дня (разбить)."
+      options: [S, M, L]
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk
+      description: "high — секреты, доступы, деньги, данные пользователей, workflow, инфраструктура, major-версии."
+      options: [low, high]
+    validations:
+      required: true
+  - type: textarea
+    id: depends
+    attributes:
+      label: Зависит от
+      description: "Ссылки на задачи: #12 или verbanium-lab/verbanium#3. Пусто, если ни от чего."
