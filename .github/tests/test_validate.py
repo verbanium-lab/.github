@@ -2,8 +2,10 @@
 
 import copy
 import importlib.util
+import os
 from pathlib import Path
 import random
+import shlex
 import string
 import subprocess
 import tempfile
@@ -151,6 +153,27 @@ class DefaultsTests(unittest.TestCase):
             self.assertEqual(result.returncode, 17, "synthetic token must fail the scan")
             self.assertNotIn(token, result.stdout + result.stderr)
             self.assertIn("REDACTED", result.stdout + result.stderr)
+
+    def test_actual_scan_commands_reject_inline_suppression(self):
+        token = "ghp" + "_" + "".join(random.Random(42).choices(string.ascii_letters + string.digits, k=36))
+        commands = [shlex.split(line) for line in (ROOT / ".github/scripts/check.sh").read_text().splitlines()
+                    if line.startswith("gitleaks ")]
+        self.assertEqual([command[1] for command in commands], ["dir", "git"])
+        with tempfile.TemporaryDirectory() as tmp:
+            # No real credential or global identity is used by this disposable Git fixture.
+            env = dict(os.environ, GIT_AUTHOR_NAME="CI Fixture", GIT_COMMITTER_NAME="CI Fixture",
+                       GIT_AUTHOR_EMAIL="ci@example.test", GIT_COMMITTER_EMAIL="ci@example.test",
+                       GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+            subprocess.run(["git", "init", "-q", tmp], check=True, env=env)
+            (Path(tmp) / "example.txt").write_text("token = " + token + " # gitleaks:allow\n")
+            subprocess.run(["git", "-C", tmp, "add", "example.txt"], check=True, env=env)
+            subprocess.run(["git", "-C", tmp, "commit", "-qm", "synthetic fixture"], check=True, env=env)
+            for command in commands:
+                command = [tmp if part == "$snapshot" else part for part in command]
+                with self.subTest(scan=command[1]):
+                    result = subprocess.run(command, cwd=tmp, env=env, capture_output=True, text=True, check=False)
+                    self.assertEqual(result.returncode, 1, "production scan must reject inline suppression")
+                    self.assertNotIn(token, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

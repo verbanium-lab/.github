@@ -10,6 +10,6 @@ git diff --check
 actionlint -color
 zizmor --offline --format=github .
 # Only validated, tracked owned files are copied; never traverse local caches/secrets.
-gitleaks dir --no-banner --redact=100 "$snapshot"
+gitleaks dir --no-banner --redact=100 --ignore-gitleaks-allow "$snapshot"
 # Full history is small here and catches credentials deleted within the PR.
-gitleaks git --no-banner --redact=100 .
+gitleaks git --no-banner --redact=100 --ignore-gitleaks-allow .

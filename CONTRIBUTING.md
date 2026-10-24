@@ -47,7 +47,7 @@ The PR template must retain its issue reference and change/verification/owner se
 must retain the current owner catch-all and explicit self-ownership rule; later override patterns
 are rejected. Actionlint and offline zizmor inspect workflows. Gitleaks scans a temporary copy of
 validated tracked files plus this repository's Git history, with findings fully redacted. It does
-not walk other checkouts or local dependency stores. Secret detection is heuristic; a green scan
+not honor inline suppression comments or walk other checkouts or local dependency stores. Secret detection is heuristic; a green scan
 does not establish that arbitrary private text is safe to publish.
 
 ## Verified tool inputs
