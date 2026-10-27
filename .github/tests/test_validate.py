@@ -141,6 +141,74 @@ class DefaultsTests(unittest.TestCase):
                 with self.assertRaises(validator.Invalid):
                     validator.validate_workflow(bad)
 
+    def reusable(self, kind):
+        name = 'image' if kind == 'image' else 'ghcr-cleanup'
+        workflow = validator.load_yaml(ROOT / f'.github/workflows/{name}.yml')
+        # Synthetic pinned references isolate boundary rejection tests from the offline pin gate.
+        for job in workflow['jobs'].values():
+            for step in job.get('steps', []):
+                if 'uses' in step:
+                    step['uses'] = step['uses'].split('@')[0] + '@' + 'a' * 40
+        validator.validate_reusable(workflow, kind)
+        return workflow
+
+    def test_reusable_rejects_unpinned_actions_and_interpolation(self):
+        for kind in ('image', 'cleanup'):
+            workflow = self.reusable(kind)
+            for job in workflow['jobs'].values():
+                for step in job.get('steps', []):
+                    if 'uses' in step:
+                        original = step['uses']
+                        step['uses'] = original.split('@')[0] + '@v1'
+                        with self.assertRaisesRegex(validator.Invalid, 'pinned approved'):
+                            validator.validate_reusable(workflow, kind)
+                        step['uses'] = original
+            first = next(iter(workflow['jobs'].values()))['steps'][0]
+            first['run'] = 'echo "${{ inputs.untrusted }}"'
+            with self.assertRaisesRegex(validator.Invalid, 'through env'):
+                validator.validate_reusable(workflow, kind)
+
+    def test_image_credential_and_event_rejections(self):
+        for mutate in (
+            lambda w: w.update(on={'pull_request_target': None}),
+            lambda w: w.update(permissions={'contents': 'read'}),
+            lambda w: w['jobs']['plan'].update(permissions={'packages': 'write'}),
+            lambda w: w['jobs']['build'].update(permissions={'contents': 'read', 'packages': 'write'}),
+            lambda w: w['jobs']['push'].update({'if': '${{ true }}'}),
+            lambda w: w['jobs']['merge'].update(needs=['plan']),
+            lambda w: w['jobs']['push']['steps'][0]['with'].update({'persist-credentials': True}),
+        ):
+            workflow = self.reusable('image')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'image')
+
+    def test_image_cache_and_attachment_rejections(self):
+        for job, key, value in (('build', 'push', True), ('build', 'cache-to', 'type=gha'),
+                                ('push', 'cache-to', 'type=gha'), ('push', 'sbom', False),
+                                ('push', 'provenance', False), ('push', 'outputs', 'type=image,push=true')):
+            workflow = self.reusable('image')
+            step = next(s for s in workflow['jobs'][job]['steps']
+                        if s.get('uses', '').startswith('docker/build-push-action@'))
+            step['with'][key] = value
+            with self.subTest(job=job, key=key), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'image')
+
+    def test_cleanup_default_and_retention_rejections(self):
+        for mutate in (
+            lambda w: w[True]['workflow_call']['inputs']['dry-run'].update(default=False),
+            lambda w: w['jobs']['cleanup'].update({'if': '${{ true }}'}),
+            lambda w: w['jobs']['cleanup'].update(permissions={'contents': 'write', 'packages': 'write'}),
+            lambda w: w['jobs']['cleanup']['steps'][1]['with'].update({'dry-run': False}),
+            lambda w: w['jobs']['cleanup']['steps'][1]['with'].update(validate=False),
+            lambda w: w['jobs']['cleanup']['steps'][1]['with'].update({'older-than': '1 day'}),
+            lambda w: w['jobs']['cleanup']['steps'][2]['with'].update({'exclude-tags': ''}),
+        ):
+            workflow = self.reusable('cleanup')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'cleanup')
+
     def test_secret_fixture_is_rejected_and_redacted(self):
         # Construct a recognizable, deliberately fake token only in a temporary file.
         token = "ghp" + "_" + "".join(random.Random(42).choices(string.ascii_letters + string.digits, k=36))

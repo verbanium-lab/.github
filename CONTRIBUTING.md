@@ -2,7 +2,7 @@
 title: Validate public organization defaults
 owner: verbanium
 status: draft
-last_reviewed: 2026-10-24
+last_reviewed: 2026-10-27
 ---
 
 # Validate public organization defaults
@@ -32,6 +32,13 @@ or a file larger than 256 KiB. The allowlist covers only the public defaults, th
 documentation. New owned files require an explicit allowlist change reviewed by the owner. Do not
 copy private toolkit content, environment files, credentials or local caches into this repository.
 No private toolkit dependency is needed to run these checks.
+
+The owned inventory also covers `image.yml`, `ghcr-cleanup.yml`, their regression tests and
+`docs/reusable-workflows.md`. Reusable workflows require empty top-level permissions, pinned
+approved actions, explicit job credential boundaries and validated cleanup defaults. Unresolved
+`TODO(pin)` references intentionally fail validation: the offline draft is not ready for adoption
+until the dispatcher verifies the pins and runs the complete check. See the
+[caller guide](docs/reusable-workflows.md) for action-API and registry checks before migration.
 
 The YAML validator rejects duplicate keys, unsafe tags, aliases, invalid types and unsupported keys.
 Its schema intentionally supports this Task form's `markdown`, `textarea` and `dropdown` profile;
