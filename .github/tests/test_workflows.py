@@ -25,6 +25,26 @@ def embedded_python(path, step):
     return textwrap.dedent(match[2])
 
 
+def github_output(text):
+    """Parse GITHUB_OUTPUT the way the runner does: name=value and name<<DELIMITER blocks."""
+    values, lines = {}, iter(text.splitlines())
+    for line in lines:
+        if '<<' in line.split('=', 1)[0]:
+            name, delimiter = line.split('<<', 1)
+            block = []
+            for item in lines:
+                if item == delimiter:
+                    break
+                block.append(item)
+            else:
+                raise AssertionError('Unterminated multiline output')
+            values[name] = '\n'.join(block)
+        else:
+            name, value = line.split('=', 1)
+            values[name] = value
+    return values
+
+
 PLAN = embedded_python('.github/workflows/image.yml', 'Validate inputs and publication boundary')
 MERGE = embedded_python('.github/workflows/image.yml', 'Merge and inspect OCI index')
 RETENTION = embedded_python('.github/workflows/ghcr-cleanup.yml', 'Protect the latest ten sha tags')
@@ -42,7 +62,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
                        GITHUB_OUTPUT=str(output))
             env.update(changes)
             result = subprocess.run([sys.executable, '-c', PLAN], env=env, capture_output=True, text=True)
-            values = dict(line.split('=', 1) for line in output.read_text().splitlines()) if output.exists() else {}
+            values = github_output(output.read_text()) if output.exists() else {}
             return result, values
 
     def test_native_platforms_and_full_sha(self):
@@ -97,8 +117,39 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 result, output = self.plan(**changes)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(output, {})
-        result, _ = self.plan(BUILD_ARGS='PUBLIC_VERSION=1.0\nPUBLIC_TITLE=Example app')
+
+    def test_build_args_are_validated_and_passed_as_a_plan_output(self):
+        accepted = (
+            '', 'WIKI_BUILD_NUMBER=42', 'WIKI_BUILD_NUMBER=42\n', 'EMPTY=',
+            'WIKI_BUILD_NUMBER=42\nWIKI_BUILD_DATE=2026-10-27T10:00:00+00:00\nWIKI_BUILD_SHA=' + 'a' * 40,
+            'A' + '_' * 63 + '=' + 'v' * 128, '\n'.join(f'K{i}=v' for i in range(10)),
+            'PATH_LIKE=registry.example/app:1.0+build-2_x',
+        )
+        for value in accepted:
+            with self.subTest(value=value):
+                result, values = self.plan(BUILD_ARGS=value)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values['build-args'], value.removesuffix('\n'))
+                self.assertEqual(values['tag'], 'sha-' + 'a' * 40)
+        rejected = (
+            'lower=value', '1KEY=value', '_KEY=value', 'KEY', 'KEY value', '=value', 'KEY==value',
+            'KEY=has space', 'KEY=quote"', "KEY=it's", 'KEY=$(id)', 'KEY=`id`', 'KEY=a;b', 'KEY=a=b',
+            'KEY=${{ secrets.TOKEN }}', 'KEY=%0A', 'KEY=\\n', 'KEY=value\r', 'KEY=a\x0bB=c', 'KEY=a\x85B=c',
+            'KEY=a\u2028B=c', 'KEY=\u00e9', 'A' * 65 + '=v', 'KEY=' + 'v' * 129,
+            'KEY=value\n\nOTHER=value', '\n', 'KEY=value\n\n', ' KEY=value', 'KEY=value ',
+            'KEY=value\nBUILD_ARGS_EOF',
+            '\n'.join(f'K{i}=v' for i in range(11)), 'KEY=one\nKEY=two',
+        )
+        for value in rejected:
+            with self.subTest(value=value):
+                result, values = self.plan(BUILD_ARGS=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {})
+
+    def test_build_args_cannot_forge_other_outputs(self):
+        result, values = self.plan(BUILD_ARGS='KEY=value')
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(values), {'matrix', 'image', 'tag', 'publish', 'build-args'})
 
     def test_merge_rejects_missing_extra_or_invalid_artifacts(self):
         for files, success in (

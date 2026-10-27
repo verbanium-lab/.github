@@ -31,7 +31,7 @@ workflow accepts a Docker build secret. Do not use `secrets: inherit` for image 
 Call `.github/workflows/image.yml` by a reviewed commit SHA. Inputs are `app-name`, `image-name`
 (full `ghcr.io/verbanium-lab/...` name without a tag), `dockerfile`, `context`, `platforms`
 (default `linux/amd64,linux/arm64`), `push-mode` (`main`, `preview`, `none`; default `none`),
-and optional newline-separated `build-args` (`KEY=value`, non-secret values only).
+and optional newline-separated `build-args` (default empty; see [Build arguments](#build-arguments)).
 
 Native `ubuntu-24.04` and `ubuntu-24.04-arm` jobs build one platform each. Publishing jobs push
 by digest and upload only digest files, retained for one day. A separate job downloads this run's
@@ -69,6 +69,31 @@ workflow must still be granted `packages: write`. Same-repository previews use o
 `GITHUB_TOKEN`; no App token, environment secret or build secret is available. Existing packages
 must grant the caller repository the required GHCR access.
 
+## Build arguments
+
+`build-args` carries public, non-secret values such as the wiki footer's build number, date and
+commit SHA (ADR 0009). It is the only free-form input, so it is validated before any build job
+runs. The `plan` job reads the input through `env`, never through an expression inside `run`, and
+fails closed unless every line matches `^[A-Z][A-Z0-9_]{0,63}=[A-Za-z0-9._:/+-]{0,128}$`, there
+are at most 10 lines, and no key repeats. Blank lines, spaces, quotes, `$`, backticks, `;`,
+`=` inside a value, carriage returns and any non-ASCII character are rejected. One trailing
+newline is allowed, so a YAML block scalar works. The build jobs receive only the validated
+`plan` output; they never see the raw input.
+
+Rules for callers:
+
+- No secrets, tokens, passwords or private URLs. Values reach image metadata and `mode=max`
+  provenance, and this repository is public. The workflow has no Docker build secrets; keep
+  runtime configuration in the caller's runtime environment.
+- Keep `sha-<sha>` deterministic per commit. A build argument changes the image bytes, so a
+  rerun of the same commit must produce the same values. Derive them only from the commit:
+  number = `git rev-list --count <sha>`, date = the commit's committer date
+  (`git show -s --format=%cI <sha>`), SHA = `github.sha`. Never use the current time, the run
+  number or attempt, the actor or any other per-run value. A rerun with different values would
+  publish different bytes under the same `sha-<sha>` tag.
+- The Dockerfile must declare each argument with `ARG` and give it a safe default so a local
+  `docker build` still works. Do not pass an argument that selects code, base images or registries.
+
 ## Wiki caller (fixed app)
 
 These are jobs to add to the existing caller, after its `ci` job. Keep its existing checks. Pin
@@ -78,8 +103,33 @@ documentation, not runnable pins. Start the caller with `permissions: {}` and gr
 
 ```yaml
 jobs:
+  build-meta:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      number: ${{ steps.meta.outputs.number }}
+      date: ${{ steps.meta.outputs.date }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Derive build metadata from the commit
+        id: meta
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          number="$(git rev-list --count "$SHA")"
+          date="$(git show -s --format=%cI "$SHA")"
+          [[ "$number" =~ ^[1-9][0-9]*$ ]]
+          [[ "$date" =~ ^[0-9T:+-]+$ ]]
+          printf 'number=%s\ndate=%s\n' "$number" "$date" >> "$GITHUB_OUTPUT"
+
   image-main:
-    needs: ci
+    needs: [ci, build-meta]
     if: >-
       ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' &&
           !startsWith(github.event.head_commit.message, 'chore: release') &&
@@ -94,9 +144,13 @@ jobs:
       dockerfile: portal/Dockerfile
       context: .
       push-mode: main
+      build-args: |
+        WIKI_BUILD_NUMBER=${{ needs.build-meta.outputs.number }}
+        WIKI_BUILD_DATE=${{ needs.build-meta.outputs.date }}
+        WIKI_BUILD_SHA=${{ github.sha }}
 
   image-preview:
-    needs: ci
+    needs: [ci, build-meta]
     if: >-
       ${{ github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name == github.repository }}
@@ -110,11 +164,18 @@ jobs:
       dockerfile: portal/Dockerfile
       context: .
       push-mode: preview
+      build-args: |
+        WIKI_BUILD_NUMBER=${{ needs.build-meta.outputs.number }}
+        WIKI_BUILD_DATE=${{ needs.build-meta.outputs.date }}
+        WIKI_BUILD_SHA=${{ github.sha }}
 
 ```
 
-Recipes have exactly two image jobs: a main push (`push-mode: main`) and a same-repository pull
-request (`push-mode: preview`). Both grant `contents: read` and `packages: write`. Do not add a
+The `build-meta` job holds only `contents: read`, so it adds no publication path; the shared
+workflow validates its outputs again. In a preview, `github.sha` is the tested merge commit, so
+the values describe that commit, matching the preview tag. Pin the checkout action like every
+other action. Recipes have exactly two image jobs: a main push (`push-mode: main`) and a
+same-repository pull request (`push-mode: preview`). Both grant `contents: read` and `packages: write`. Do not add a
 third job for fork pull requests.
 
 ### Why callers have no fork job
@@ -148,8 +209,9 @@ The main `if:` skips a commit whose first line begins `chore: release`, or whose
 is `verbanium-ci[bot]`. Keep the condition on the caller job so a release metadata commit starts
 no image runners. This is an optimization, not an authorization check. If release-please uses
 another title or GitHub reports a different author field, verify the event and update the recipe.
-Wiki does not need Turbo or a release-please job. Its version build arguments can be supplied by
-the caller once their Dockerfile contract is defined; this workflow does not invent that contract.
+Wiki does not need Turbo or a release-please job. Its footer build arguments are supplied as in
+the recipe above; the wiki Dockerfile must declare `WIKI_BUILD_NUMBER`, `WIKI_BUILD_DATE` and
+`WIKI_BUILD_SHA`, and this workflow does not define that contract.
 
 ## Tower caller (affected app matrix)
 
@@ -289,7 +351,7 @@ policy protects at least ten recent sha-tagged versions and all their SHA aliase
 ## Verification and recovery
 
 Run the repository check from [CONTRIBUTING.md](../CONTRIBUTING.md). Rejection tests cover action
-pinning, token permissions, PR publication boundaries, malformed digest artifacts, cache writes
+pinning, build-argument validation and its raw-input boundary, token permissions, PR publication boundaries, malformed digest artifacts, cache writes
 and cleanup retention. Offline tests cannot prove action input compatibility or registry effects.
 In a disposable caller/package, first build `none`, publish both native platforms, inspect the
 index's platform descriptors and attestation manifests, and exercise cleanup with protected,

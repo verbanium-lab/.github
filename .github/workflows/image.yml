@@ -28,7 +28,9 @@ on:
         default: none
         type: string
       build-args:
-        description: Newline-separated KEY=value pairs; public non-secret values only
+        description: >-
+          Optional newline-separated KEY=value lines, at most 10. Keys match [A-Z][A-Z0-9_]{0,63};
+          values match [A-Za-z0-9._:/+-]{0,128}. Public values derived only from the commit; never secrets
         default: ''
         type: string
     outputs:
@@ -62,6 +64,7 @@ jobs:
       image: ${{ steps.plan.outputs.image }}
       tag: ${{ steps.plan.outputs.tag }}
       publish: ${{ steps.plan.outputs.publish }}
+      build-args: ${{ steps.plan.outputs.build-args }}
     steps:
       - name: Validate inputs and publication boundary
         id: plan
@@ -97,8 +100,12 @@ jobs:
               path = PurePosixPath(env[key])
               require(env[key] and not path.is_absolute() and '..' not in path.parts
                       and re.fullmatch(r'[A-Za-z0-9_./-]+', env[key]), 'Invalid build path')
-          for arg in env['BUILD_ARGS'].splitlines():
-              require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=[^\x00-\x1f\x7f]*', arg), 'Invalid build argument')
+          # Split on LF only: splitlines() would also break on other separators and hide them from the pattern.
+          build_args = env['BUILD_ARGS'].removesuffix('\n').split('\n') if env['BUILD_ARGS'] else []
+          require(len(build_args) <= 10, 'Too many build arguments')
+          for arg in build_args:
+              require(re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}=[A-Za-z0-9._:/+-]{0,128}', arg), 'Invalid build argument')
+          require(len({arg.split('=', 1)[0] for arg in build_args}) == len(build_args), 'Duplicate build argument')
           runners = {'linux/amd64': 'ubuntu-24.04', 'linux/arm64': 'ubuntu-24.04-arm'}
           platforms = [p.strip() for p in env['PLATFORMS'].split(',')]
           require(platforms and len(set(platforms)) == len(platforms)
@@ -122,6 +129,11 @@ jobs:
                                  'image': env['IMAGE'], 'tag': tag,
                                  'publish': str(mode != 'none').lower()}.items():
                   print(f'{key}={value}', file=output)
+              # Validated lines cannot contain the delimiter (no '='), so the multiline value is injection-safe.
+              if build_args:
+                  print('build-args<<BUILD_ARGS_EOF', *build_args, 'BUILD_ARGS_EOF', sep='\n', file=output)
+              else:
+                  print('build-args=', file=output)
           PY
 
   build:
@@ -146,7 +158,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
-          build-args: ${{ inputs.build-args }}
+          build-args: ${{ needs.plan.outputs.build-args }}
           push: false
           provenance: mode=max
           sbom: true
@@ -188,7 +200,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
-          build-args: ${{ inputs.build-args }}
+          build-args: ${{ needs.plan.outputs.build-args }}
           outputs: type=image,name=${{ needs.plan.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
