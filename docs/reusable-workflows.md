@@ -57,13 +57,17 @@ the same image, source SHA and mode so a rerun cannot replace the tag between in
 digest inspection. Reserve its `reusable-image-*` concurrency group prefix for this workflow.
 
 The workflow itself grants no permissions. The caller grants `contents: read` and
-`packages: write` only on jobs that call a publishing mode. Inside the reusable workflow, only
+`packages: write` on every job that calls it. GitHub validates a nested job's requested
+permissions statically against the caller job's grant, so a caller job without `packages: write`
+is rejected even when the job is skipped or calls `none` mode. Inside the reusable workflow, only
 platform publication and index merge jobs get `packages: write`; `none` jobs get `contents: read`.
 The workflow rejects main publication outside a main push and preview publication outside a
 same-repository `pull_request`. It rejects privileged PR events, including `pull_request_target`.
-Fork PRs call `none` with read-only permissions. Same-repository previews use only `GITHUB_TOKEN`;
-no App token, environment secret or build secret is available. Existing packages must grant the
-caller repository the required GHCR access.
+`none` mode builds without publishing and runs with read-only permissions, but see
+[Why callers have no fork job](#why-callers-have-no-fork-job): a caller job that calls this
+workflow must still be granted `packages: write`. Same-repository previews use only
+`GITHUB_TOKEN`; no App token, environment secret or build secret is available. Existing packages
+must grant the caller repository the required GHCR access.
 
 ## Wiki caller (fixed app)
 
@@ -107,21 +111,38 @@ jobs:
       context: .
       push-mode: preview
 
-  image-fork:
-    needs: ci
-    if: >-
-      ${{ github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name != github.repository }}
-    permissions:
-      contents: read
-    uses: verbanium-lab/.github/.github/workflows/image.yml@REVIEWED_WORKFLOW_COMMIT
-    with:
-      app-name: wiki
-      image-name: ghcr.io/verbanium-lab/wiki
-      dockerfile: portal/Dockerfile
-      context: .
-      push-mode: none
 ```
+
+Recipes have exactly two image jobs: a main push (`push-mode: main`) and a same-repository pull
+request (`push-mode: preview`). Both grant `contents: read` and `packages: write`. Do not add a
+third job for fork pull requests.
+
+### Why callers have no fork job
+
+An earlier recipe had a fork-only `image-fork` job calling `push-mode: none` with only
+`contents: read`. The first real caller (tower-apps PR #17) failed with "The nested job 'push' is
+requesting 'packages: write', but is only allowed 'packages: none'". The reusable workflow
+declares `packages: write` on its publication jobs, and GitHub checks that against the caller
+job's grant when it parses the workflow. The check is static: the `if:` condition and `push-mode`
+are not evaluated, and a skipped job is still validated. A caller job cannot lower the nested
+permissions, so every calling job needs `packages: write`.
+
+The job is also unnecessary for this organization's private repositories. A fork of a private
+organization repository cannot exist outside the organization, so pull requests in these
+repositories come from same-repository branches and the same-repository condition on the preview
+job covers them. Keep that condition; do not widen it to run previews for forks.
+
+A public repository that accepts outside fork pull requests needs a different design. Granting
+`packages: write` to a fork-facing job is not acceptable, and a caller-level `packages: write`
+grant is required even for build-only calls to this workflow. Follow-up options, not implemented
+here:
+
+- a separate build-only workflow, with no jobs that call publishing workflows, run on
+  `pull_request` with read-only permissions; or
+- a build-only reusable workflow without publication jobs, so no nested job requests
+  `packages: write`.
+
+Do not use `pull_request_target` or `secrets: inherit` for either option.
 
 The main `if:` skips a commit whose first line begins `chore: release`, or whose author username
 is `verbanium-ci[bot]`. Keep the condition on the caller job so a release metadata commit starts
@@ -206,8 +227,8 @@ production secrets or an inherited App token.
       push-mode: main
 ```
 
-Use the wiki preview/fork job split with the same `has-images` guard, matrix and `with` mapping
-for monorepo PRs. Add apps to the explicit mapping as the repository gains apps; Turbo includes
+Add the wiki preview job (no fork job; see above) with the same `has-images` guard, matrix and
+`with` mapping for monorepo PRs, granting `contents: read` and `packages: write`. Add apps to the explicit mapping as the repository gains apps; Turbo includes
 dependents affected by shared packages. Validate changes to workspace-wide files in the first
 caller run so they cannot unexpectedly produce an empty app matrix.
 
