@@ -194,6 +194,33 @@ class DefaultsTests(unittest.TestCase):
             with self.subTest(job=job, key=key), self.assertRaises(validator.Invalid):
                 validator.validate_reusable(workflow, 'image')
 
+    def test_image_build_args_boundary_rejections(self):
+        def build_step(workflow, job):
+            return next(s for s in workflow['jobs'][job]['steps']
+                        if s.get('uses', '').startswith('docker/build-push-action@'))
+
+        for mutate in (
+            lambda w: build_step(w, 'build')['with'].update({'build-args': '${{ inputs.build-args }}'}),
+            lambda w: build_step(w, 'push')['with'].update({'build-args': '${{ inputs.build-args }}'}),
+            lambda w: build_step(w, 'push')['with'].update({'build-args': 'KEY=${{ secrets.TOKEN }}'}),
+            lambda w: build_step(w, 'push')['with'].pop('build-args'),
+            lambda w: w['jobs']['push']['steps'][0].update(run='echo "${{ inputs.build-args }}"'),
+            lambda w: w['jobs']['push']['steps'][0].update(env={'ARGS': '${{ inputs.build-args }}'}),
+            lambda w: w['jobs']['merge'].update({'if': "${{ inputs.build-args != '' }}"}),
+            lambda w: w['jobs']['push']['steps'][0].update(
+                {'with': {'persist-credentials': False, 'build-args': 'KEY=value'}}),
+            lambda w: w['jobs']['plan']['steps'][0]['env'].update(BUILD_ARGS='KEY=value'),
+            lambda w: w['jobs']['plan']['steps'][0]['env'].pop('BUILD_ARGS'),
+            lambda w: w['jobs']['plan']['outputs'].pop('build-args'),
+            lambda w: w[True]['workflow_call']['inputs']['build-args'].update(default='KEY=value'),
+            lambda w: w[True]['workflow_call']['inputs']['build-args'].update(required=True),
+            lambda w: w[True]['workflow_call']['inputs']['build-args'].update(type='boolean'),
+        ):
+            workflow = self.reusable('image')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'image')
+
     def test_cleanup_default_and_retention_rejections(self):
         for mutate in (
             lambda w: w[True]['workflow_call']['inputs']['dry-run'].update(default=False),

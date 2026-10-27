@@ -244,10 +244,30 @@ def validate_reusable(workflow, kind):
                     and jobs[name].get("if") == "${{ needs.plan.outputs.publish == '" + publish + "' }}",
                     "publication must depend on validated plan")
         require(jobs["merge"].get("needs") == ["plan", "push"], "merge must wait for platform publication")
+        declared = call.get("inputs", {}).get("build-args", {})
+        require(declared.get("type") == "string" and declared.get("default") == "" and not declared.get("required"),
+                "optional string build-args input required")
+        require(jobs["plan"]["outputs"].get("build-args") == "${{ steps.plan.outputs.build-args }}",
+                "validated build-args output required")
+        # The raw input may enter only the plan step's env; every other use is an injection path.
+        for name, job in jobs.items():
+            for step in job.get("steps", []):
+                env = {k: v for k, v in step.get("env", {}).items() if not (name == "plan" and k == "BUILD_ARGS")}
+                require("inputs.build-args" not in repr({**step, "env": env}) and "inputs.build-args" not in repr(
+                    {k: v for k, v in job.items() if k != "steps"}), "raw build-args input may only enter the plan step through env")
+                if step.get("env", {}).get("BUILD_ARGS") is not None:
+                    require(name == "plan" and step["env"]["BUILD_ARGS"] == "${{ inputs.build-args }}",
+                            "plan must read build-args through env")
+                if not step.get("uses", "").startswith("docker/build-push-action@"):
+                    require("build-args" not in step.get("with", {}), "build-args only on the build-push step")
+        require(any(s.get("env", {}).get("BUILD_ARGS") == "${{ inputs.build-args }}" for s in jobs["plan"]["steps"]),
+                "plan must validate build-args")
         for name in ("build", "push"):
             for step in jobs[name]["steps"]:
                 if step.get("uses", "").startswith("docker/build-push-action@"):
                     options = step.get("with", {})
+                    require(options.get("build-args") == "${{ needs.plan.outputs.build-args }}",
+                            "build-args only from the validated plan output")
                     require(options.get("provenance") == "mode=max" and options.get("sbom") is True,
                             "image attachments required")
                     if name == "build":
