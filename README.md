@@ -2,7 +2,7 @@
 title: Public organization defaults
 owner: verbanium
 status: active
-last_reviewed: 2026-10-24
+last_reviewed: 2026-10-27
 ---
 
 # .github
@@ -21,3 +21,14 @@ GitHub applies these defaults to other repositories only while the `.github` rep
 The single `ci` job validates these public contracts, file boundaries and workflows on every pull
 request and main push. See [validation and the public protection boundary](CONTRIBUTING.md) for the
 local check and the owner-controlled activation steps.
+
+## Reusable workflows
+
+| Workflow | Purpose |
+| --- | --- |
+| [image.yml](.github/workflows/image.yml) | Native amd64/arm64 builds, main and same-repository preview publication, provenance and SBOM |
+| [ghcr-cleanup.yml](.github/workflows/ghcr-cleanup.yml) | Per-package retention with protected release/deployed tags; dry-run by default |
+
+See [caller recipes and adoption requirements](docs/reusable-workflows.md) for fixed-app wiki and
+affected-matrix Tower examples, release-commit filters and token boundaries. Unresolved action pins
+must be completed before adoption. This change does not migrate any app caller.

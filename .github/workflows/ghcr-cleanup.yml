@@ -1,0 +1,115 @@
+name: Reusable GHCR cleanup
+
+on:
+  workflow_call:
+    inputs:
+      package-name:
+        description: GHCR container package name in verbanium-lab, without the registry or owner
+        required: true
+        type: string
+      dry-run:
+        description: Report candidates without deleting versions; disable only after review
+        default: true
+        type: boolean
+    secrets:
+      app-token:
+        description: Optional verbanium-ci App installation token with package administration access
+        required: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  cleanup:
+    # No PR code or checkout runs with the cleanup credential.
+    if: >-
+      ${{ github.repository_owner == 'verbanium-lab' && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    concurrency:
+      group: ghcr-cleanup-${{ inputs.package-name }}
+      cancel-in-progress: false
+    permissions:
+      packages: write
+    steps:
+      - name: Protect the latest ten sha tags
+        id: retention
+        env:
+          GH_TOKEN: ${{ secrets.app-token || github.token }}
+          PACKAGE: ${{ inputs.package-name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          env = os.environ
+          if not re.fullmatch(r'[a-z0-9]+(?:[._/-][a-z0-9]+)*', env['PACKAGE']):
+              raise SystemExit('Invalid package name')
+          versions = []
+          page = 1
+          while True:
+              url = ('https://api.github.com/orgs/verbanium-lab/packages/container/'
+                     + quote(env['PACKAGE'], safe='') + f'/versions?per_page=100&page={page}')
+              request = Request(url, headers={'Authorization': 'Bearer ' + env['GH_TOKEN'],
+                                             'Accept': 'application/vnd.github+json',
+                                             'X-GitHub-Api-Version': '2022-11-28'})
+              with urlopen(request, timeout=30) as response:
+                  batch = json.load(response)
+              versions.extend(batch)
+              if len(batch) < 100:
+                  break
+              page += 1
+          # Preserve aliases on the newest ten sha-tagged versions, independently of release tags.
+          versions.sort(key=lambda v: (v['created_at'], v['id']), reverse=True)
+          protected = []
+          count = 0
+          for version in versions:
+              tags = version['metadata']['container']['tags']
+              sha_tags = [tag for tag in tags if re.fullmatch(r'sha-[A-Za-z0-9_.-]+', tag)]
+              if sha_tags:
+                  protected.extend(sha_tags)
+                  count += 1
+                  if count == 10:
+                      break
+          # Only validated tag characters enter the output; escape regex metacharacters.
+          exclude = '^(?:v.*|deployed-.*' + ''.join('|' + re.escape(tag) for tag in protected) + ')$'
+          with open(env['GITHUB_OUTPUT'], 'a') as output:
+              print('exclude=' + exclude, file=output)
+          PY
+      - name: Expire previews after fourteen days
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          token: ${{ secrets.app-token || github.token }}
+          owner: verbanium-lab
+          package: ${{ inputs.package-name }}
+          use-regex: true
+          delete-tags: '^pr-.*$'
+          exclude-tags: '^(v.*|deployed-.*|sha-.*)$'
+          older-than: 14 days
+          delete-untagged: false
+          delete-ghost-images: false
+          delete-orphaned-images: false
+          dry-run: ${{ inputs.dry-run }}
+          validate: true
+      - name: Expire old sha tags and unreferenced multi-arch children
+        uses: dataaxiom/ghcr-cleanup-action@d52806a0dc70b430571a37da1fde39733ffd640f # v1.2.2
+        with:
+          token: ${{ secrets.app-token || github.token }}
+          owner: verbanium-lab
+          package: ${{ inputs.package-name }}
+          use-regex: true
+          delete-tags: '^sha-.*$'
+          exclude-tags: ${{ steps.retention.outputs.exclude }}
+          older-than: 30 days
+          delete-untagged: true
+          delete-ghost-images: true
+          delete-orphaned-images: true
+          dry-run: ${{ inputs.dry-run }}
+          validate: true

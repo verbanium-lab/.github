@@ -1,0 +1,281 @@
+name: Reusable native image build
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: Stable application name used for labels, artifacts and cache scopes
+        required: true
+        type: string
+      image-name:
+        description: Full lowercase ghcr.io/verbanium-lab image name, without a tag
+        required: true
+        type: string
+      dockerfile:
+        description: Dockerfile path relative to the repository root
+        required: true
+        type: string
+      context:
+        description: Build context relative to the repository root
+        required: true
+        type: string
+      platforms:
+        description: Comma-separated subset of linux/amd64,linux/arm64
+        default: linux/amd64,linux/arm64
+        type: string
+      push-mode:
+        description: main, preview or none; publication is also checked against the event
+        default: none
+        type: string
+      build-args:
+        description: Newline-separated KEY=value pairs; public non-secret values only
+        default: ''
+        type: string
+    outputs:
+      image:
+        description: Image name without a tag or digest
+        value: ${{ jobs.plan.outputs.image }}
+      digest:
+        description: Published OCI index digest; empty in none mode
+        value: ${{ jobs.merge.outputs.digest }}
+      tags:
+        description: Published fully qualified tag; empty in none mode
+        value: ${{ jobs.merge.outputs.tags }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+# Serialize the complete publication, including index inspection, across caller reruns.
+concurrency:
+  group: reusable-image-${{ inputs.image-name }}-${{ github.sha }}-${{ inputs.push-mode }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      image: ${{ steps.plan.outputs.image }}
+      tag: ${{ steps.plan.outputs.tag }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: Validate inputs and publication boundary
+        id: plan
+        env:
+          APP: ${{ inputs.app-name }}
+          IMAGE: ${{ inputs.image-name }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          PLATFORMS: ${{ inputs.platforms }}
+          MODE: ${{ inputs.push-mode }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import PurePosixPath
+
+          def require(ok, message):
+              if not ok:
+                  raise SystemExit(message)
+
+          env = os.environ
+          require(re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', env['APP']), 'Invalid app name')
+          require(re.fullmatch(r'ghcr\.io/verbanium-lab/[a-z0-9]+(?:[._/-][a-z0-9]+)*', env['IMAGE']), 'Invalid image name')
+          for key in ('DOCKERFILE', 'CONTEXT'):
+              path = PurePosixPath(env[key])
+              require(env[key] and not path.is_absolute() and '..' not in path.parts
+                      and re.fullmatch(r'[A-Za-z0-9_./-]+', env[key]), 'Invalid build path')
+          for arg in env['BUILD_ARGS'].splitlines():
+              require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=[^\x00-\x1f\x7f]*', arg), 'Invalid build argument')
+          runners = {'linux/amd64': 'ubuntu-24.04', 'linux/arm64': 'ubuntu-24.04-arm'}
+          platforms = [p.strip() for p in env['PLATFORMS'].split(',')]
+          require(platforms and len(set(platforms)) == len(platforms)
+                  and all(p in runners for p in platforms), 'Unsupported or duplicate platform')
+          require(re.fullmatch(r'[0-9a-f]{40}', env['SHA']), 'Invalid source SHA')
+          mode = env['MODE']
+          require(mode in ('main', 'preview', 'none'), 'Invalid push mode')
+          require(env['EVENT'] == 'pull_request'
+                  or (env['EVENT'] == 'push' and env['REF'] == 'refs/heads/main'), 'Unsupported build event')
+          tag = ''
+          if mode == 'main':
+              require(env['EVENT'] == 'push' and env['REF'] == 'refs/heads/main', 'Main push required')
+              tag = 'sha-' + env['SHA']
+          elif mode == 'preview':
+              require(env['EVENT'] == 'pull_request' and env['HEAD_REPOSITORY'] == env['REPOSITORY']
+                      and re.fullmatch(r'[1-9][0-9]*', env['PR_NUMBER']), 'Same-repository PR required')
+              tag = 'pr-' + env['PR_NUMBER'] + '-' + env['SHA'][:12]
+          matrix = {'include': [{'platform': p, 'arch': p.split('/')[1], 'runner': runners[p]} for p in platforms]}
+          with open(env['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in {'matrix': json.dumps(matrix, separators=(',', ':')),
+                                 'image': env['IMAGE'], 'tag': tag,
+                                 'publish': str(mode != 'none').lower()}.items():
+                  print(f'{key}={value}', file=output)
+          PY
+
+  build:
+    name: Build only (${{ matrix.platform }})
+    needs: plan
+    if: ${{ needs.plan.outputs.publish == 'false' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build without registry credentials
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build-args }}
+          push: false
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.title=${{ inputs.app-name }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.app-name }}-${{ matrix.arch }}-main
+        env:
+          DOCKER_BUILD_SUMMARY: 'false'
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+
+  push:
+    name: Publish platform (${{ matrix.platform }})
+    needs: plan
+    if: ${{ needs.plan.outputs.publish == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ inputs.build-args }}
+          outputs: type=image,name=${{ needs.plan.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.title=${{ inputs.app-name }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.app-name }}-${{ matrix.arch }}-main
+          # PRs never save caches; only main can populate a publishing cache.
+          cache-to: ${{ inputs.push-mode == 'main' && format('type=gha,scope={0}-{1}-main,mode=max', inputs.app-name, matrix.arch) || '' }}
+        env:
+          DOCKER_BUILD_SUMMARY: 'false'
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+      - name: Record platform digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$DIGEST" > "$RUNNER_TEMP/digests/$ARCH"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digests-${{ inputs.app-name }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Log out of GHCR
+        if: ${{ always() }}
+        run: docker logout ghcr.io
+
+  merge:
+    needs: [plan, push]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    outputs:
+      digest: ${{ steps.merge.outputs.digest }}
+      tags: ${{ steps.merge.outputs.tags }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digests-${{ inputs.app-name }}-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Merge and inspect OCI index
+        id: merge
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          env = os.environ
+          directory = Path(env['RUNNER_TEMP']) / 'digests'
+          arches = [p['arch'] for p in json.loads(env['MATRIX'])['include']]
+          if {p.name for p in directory.iterdir()} != set(arches):
+              raise SystemExit('Missing or unexpected platform digest')
+          with open(Path(env['RUNNER_TEMP']) / 'sources.txt', 'w') as output:
+              for arch in arches:
+                  digest = (directory / arch).read_text().strip()
+                  if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+                      raise SystemExit('Invalid platform digest')
+                  print(env['IMAGE'] + '@' + digest, file=output)
+          PY
+          mapfile -t sources < "$RUNNER_TEMP/sources.txt"
+          docker buildx imagetools create --tag "$IMAGE:$TAG" "${sources[@]}"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "digest=$digest"
+            echo "tags=$IMAGE:$TAG"
+          } >> "$GITHUB_OUTPUT"
+          printf 'Image: %s:%s\n\nDeploy by digest: %s@%s\n' \
+            "$IMAGE" "$TAG" "$IMAGE" "$digest" >> "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: ${{ always() }}
+        run: docker logout ghcr.io

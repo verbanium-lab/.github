@@ -18,6 +18,8 @@ OWNED_FILES = {
     ".github/workflows/ci.yml", ".github/scripts/validate.py",
     ".github/scripts/check.sh", ".github/scripts/install-tool.sh",
     ".github/scripts/requirements.txt", ".github/tests/test_validate.py",
+    ".github/workflows/image.yml", ".github/workflows/ghcr-cleanup.yml",
+    ".github/tests/test_workflows.py", "docs/reusable-workflows.md",
 }
 FIELDS = {
     "goal": ("textarea", "Goal", None),
@@ -199,6 +201,79 @@ def validate_workflow(workflow):
     require(any(step.get("run") == "bash .github/scripts/check.sh" for step in steps), "real repository check required")
 
 
+def validate_reusable(workflow, kind):
+    """Keep the reusable workflows inside their reviewed credential boundaries."""
+    require(isinstance(workflow, dict), "workflow must be a mapping")
+    events = workflow.get("on", workflow.get(True))
+    require(isinstance(events, dict) and set(events) == {"workflow_call"}, "reusable workflow_call only")
+    require(workflow.get("permissions") == {}, "reusable workflow permissions must be empty")
+    jobs = workflow.get("jobs", {})
+    require(isinstance(jobs, dict), "reusable jobs required")
+    actions = {
+        "image": {"actions/checkout", "docker/setup-buildx-action", "docker/build-push-action",
+                  "actions/upload-artifact", "actions/download-artifact"},
+        "cleanup": {"dataaxiom/ghcr-cleanup-action"},
+    }[kind]
+    for job in jobs.values():
+        require(isinstance(job, dict) and "uses" not in job, "local reusable jobs required")
+        require(type(job.get("timeout-minutes")) is int and 0 < job["timeout-minutes"] <= 30,
+                "bounded reusable timeout required")
+        require("continue-on-error" not in job, "reusable jobs must fail closed")
+        for step in job.get("steps", []):
+            require(isinstance(step, dict) and "continue-on-error" not in step, "reusable steps must fail closed")
+            require("${{" not in step.get("run", ""), "expressions must enter scripts through env")
+            if "uses" in step:
+                action, _, ref = step["uses"].partition("@")
+                require(action in actions and re.fullmatch(r"[0-9a-f]{40}", ref),
+                        "pinned approved reusable action required (resolve TODO(pin))")
+                if action == "actions/checkout":
+                    require(step.get("with", {}).get("persist-credentials") is False,
+                            "checkout credentials must not persist")
+    call = events["workflow_call"]
+    require(isinstance(call, dict), "reusable call schema required")
+    if kind == "image":
+        require(set(jobs) == {"plan", "build", "push", "merge"}, "image job boundary required")
+        require(not call.get("secrets"), "image workflow must not accept secrets")
+        require(call.get("inputs", {}).get("push-mode", {}).get("default") == "none", "build-only default required")
+        permissions = {"plan": {}, "build": {"contents": "read"},
+                       "push": {"contents": "read", "packages": "write"}, "merge": {"packages": "write"}}
+        for name, expected in permissions.items():
+            require(jobs[name].get("permissions", {}) == expected, "image job permission boundary required")
+        for name, publish in (("build", "false"), ("push", "true")):
+            require(jobs[name].get("needs") == "plan"
+                    and jobs[name].get("if") == "${{ needs.plan.outputs.publish == '" + publish + "' }}",
+                    "publication must depend on validated plan")
+        require(jobs["merge"].get("needs") == ["plan", "push"], "merge must wait for platform publication")
+        for name in ("build", "push"):
+            for step in jobs[name]["steps"]:
+                if step.get("uses", "").startswith("docker/build-push-action@"):
+                    options = step.get("with", {})
+                    require(options.get("provenance") == "mode=max" and options.get("sbom") is True,
+                            "image attachments required")
+                    if name == "build":
+                        require(options.get("push") is False and "outputs" not in options
+                                and "cache-to" not in options, "build-only must not publish or save caches")
+                    else:
+                        require("push-by-digest=true" in options.get("outputs", ""), "digest publication required")
+                        require(options.get("cache-to", "").startswith("${{ inputs.push-mode == 'main' &&"),
+                                "only main may save publishing caches")
+    else:
+        require(set(jobs) == {"cleanup"}, "one cleanup job required")
+        require(call.get("inputs", {}).get("dry-run", {}).get("default") is True, "cleanup dry-run default required")
+        require(jobs["cleanup"].get("permissions") == {"packages": "write"}, "cleanup permission boundary required")
+        guard = jobs["cleanup"].get("if", "")
+        require("github.ref == 'refs/heads/main'" in guard and "github.event_name == 'schedule'" in guard
+                and "github.event_name == 'workflow_dispatch'" in guard, "main-only cleanup events required")
+        passes = [s for s in jobs["cleanup"]["steps"] if "uses" in s]
+        require(len(passes) == 2, "two age-specific cleanup passes required")
+        for step, age in zip(passes, ("14 days", "30 days")):
+            options = step.get("with", {})
+            require(options.get("dry-run") == "${{ inputs.dry-run }}" and options.get("validate") is True,
+                    "cleanup must honor dry-run and validate")
+            require(options.get("older-than") == age and options.get("exclude-tags")
+                    and options.get("use-regex") is True, "cleanup retention boundary required")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, help="Copy validated owned files for a redacted secret scan")
@@ -211,6 +286,8 @@ def main():
         validate_pr((root / ".github/pull_request_template.md").read_text())
         validate_owners((root / ".github/CODEOWNERS").read_text())
         validate_workflow(load_yaml(root / ".github/workflows/ci.yml"))
+        validate_reusable(load_yaml(root / ".github/workflows/image.yml"), "image")
+        validate_reusable(load_yaml(root / ".github/workflows/ghcr-cleanup.yml"), "cleanup")
         if args.snapshot:
             for path in paths:
                 target = args.snapshot / path
