@@ -27,6 +27,10 @@ on:
         description: main, preview or none; publication is also checked against the event
         default: none
         type: string
+      npm-registry-auth:
+        description: Expose this job's GITHUB_TOKEN as BuildKit secret npm_token for private npm packages
+        default: false
+        type: boolean
       build-args:
         description: >-
           Optional newline-separated KEY=value lines, at most 10. Keys match [A-Z][A-Z0-9_]{0,63};
@@ -147,18 +151,20 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      packages: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - name: Build without registry credentials
+      - name: Build without publishing
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
           build-args: ${{ needs.plan.outputs.build-args }}
+          secrets: ${{ inputs.npm-registry-auth && format('npm_token={0}', github.token) || '' }}
           push: false
           provenance: mode=max
           sbom: true
@@ -201,6 +207,7 @@ jobs:
           file: ${{ inputs.dockerfile }}
           platforms: ${{ matrix.platform }}
           build-args: ${{ needs.plan.outputs.build-args }}
+          secrets: ${{ inputs.npm-registry-auth && format('npm_token={0}', github.token) || '' }}
           outputs: type=image,name=${{ needs.plan.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
