@@ -306,7 +306,7 @@ the recipe above; the wiki Dockerfile must declare `WIKI_BUILD_NUMBER`, `WIKI_BU
 
 Use a documented caller step rather than another reusable workflow: installing dependencies,
 the package-to-image mapping and smoke services belong to the app repository. Tower's current
-`origin/main` catalog pins Turbo 2.11.9 and its app is `@verbanium/tower` at `apps/dashboard`.
+`origin/main` catalog pins Turbo 2.11.9 and its app is `@verbanium-lab/tower` at `apps/dashboard`.
 The JSON schema below needs verification against that installed CLI before migration; unknown
 schema or missing Git base fails instead of quietly skipping images.
 
@@ -338,7 +338,7 @@ PR compares its base SHA with the checked-out merge commit. All referenced commi
         raise SystemExit('Unsupported turbo ls output')
     affected = {p['name'] for p in items}
     # Explicit allowlist: never turn a package's arbitrary metadata into a publish destination.
-    apps = [{'package': '@verbanium/tower', 'app': 'tower',
+    apps = [{'package': '@verbanium-lab/tower', 'app': 'tower',
              'image': 'ghcr.io/verbanium-lab/tower', 'dockerfile': 'Dockerfile', 'context': '.'}]
     selected = [{k: v for k, v in app.items() if k != 'package'} for app in apps if app['package'] in affected]
     with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
