@@ -2,7 +2,7 @@
 title: Reusable image builds and registry cleanup
 owner: verbanium
 status: draft
-last_reviewed: 2026-10-27
+last_reviewed: 2026-10-28
 ---
 
 # Reusable image builds and registry cleanup
@@ -23,14 +23,16 @@ GHCR access, index attachments and cleanup candidates require a real caller run 
 
 This repository is public. Caller examples contain only public organization repository references.
 Keep runtime configuration and secrets in callers; never put them in build arguments, labels,
-workflow inputs or this repository. `mode=max` provenance can disclose build arguments. Neither
-workflow accepts a Docker build secret. Do not use `secrets: inherit` for image builds or previews.
+workflow inputs or this repository. `mode=max` provenance can disclose build arguments. Image builds
+can opt into the job's `GITHUB_TOKEN` as the `npm_token` BuildKit secret; no caller-provided workflow
+secret is accepted. Do not use `secrets: inherit` for image builds or previews.
 
 ## Image contract
 
 Call `.github/workflows/image.yml` by a reviewed commit SHA. Inputs are `app-name`, `image-name`
 (full `ghcr.io/verbanium-lab/...` name without a tag), `dockerfile`, `context`, `platforms`
 (default `linux/amd64,linux/arm64`), `push-mode` (`main`, `preview`, `none`; default `none`),
+optional `npm-registry-auth` (boolean, default `false`; see [Private npm packages](#private-npm-packages)),
 and optional newline-separated `build-args` (default empty; see [Build arguments](#build-arguments)).
 
 Native `ubuntu-24.04` and `ubuntu-24.04-arm` jobs build one platform each. Publishing jobs push
@@ -60,13 +62,15 @@ The workflow itself grants no permissions. The caller grants `contents: read` an
 `packages: write` on every job that calls it. GitHub validates a nested job's requested
 permissions statically against the caller job's grant, so a caller job without `packages: write`
 is rejected even when the job is skipped or calls `none` mode. Inside the reusable workflow, only
-platform publication and index merge jobs get `packages: write`; `none` jobs get `contents: read`.
+platform publication and index merge jobs get `packages: write`; `none` jobs get `contents: read`
+and `packages: read`. Job permissions are static, so the read grant is present even when npm auth
+is off; the token is passed to BuildKit only when `npm-registry-auth: true`.
 The workflow rejects main publication outside a main push and preview publication outside a
 same-repository `pull_request`. It rejects privileged PR events, including `pull_request_target`.
 `none` mode builds without publishing and runs with read-only permissions, but see
 [Why callers have no fork job](#why-callers-have-no-fork-job): a caller job that calls this
 workflow must still be granted `packages: write`. Same-repository previews use only
-`GITHUB_TOKEN`; no App token, environment secret or build secret is available. Existing packages
+`GITHUB_TOKEN`; no App token or environment secret is available. Existing image packages
 must grant the caller repository the required GHCR access.
 
 ## Build arguments
@@ -83,8 +87,8 @@ newline is allowed, so a YAML block scalar works. The build jobs receive only th
 Rules for callers:
 
 - No secrets, tokens, passwords or private URLs. Values reach image metadata and `mode=max`
-  provenance, and this repository is public. The workflow has no Docker build secrets; keep
-  runtime configuration in the caller's runtime environment.
+  provenance, and this repository is public. Use the opt-in BuildKit secret below for npm installs;
+  keep runtime configuration in the caller's runtime environment.
 - Keep `sha-<sha>` deterministic per commit. A build argument changes the image bytes, so a
   rerun of the same commit must produce the same values. Derive them only from the commit:
   number = `git rev-list --count <sha>`, date = the commit's committer date
@@ -93,6 +97,89 @@ Rules for callers:
   publish different bytes under the same `sha-<sha>` tag.
 - The Dockerfile must declare each argument with `ARG` and give it a safe default so a local
   `docker build` still works. Do not pass an argument that selects code, base images or registries.
+
+## Private npm packages
+
+The owner selected private GitHub Packages in `verbanium-lab/packages` on 2026-10-28, with scope
+`@verbanium-lab` and registry `https://npm.pkg.github.com`. In each consumer, commit this `.npmrc`
+beside its workspace `package.json`. Keep the environment placeholder literal:
+
+```ini
+@verbanium-lab:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+```
+
+### Image installs
+
+Set `npm-registry-auth: true` on the calling image job. Both native build paths pass their own
+job's `GITHUB_TOKEN` through the pinned build-push action's [`secrets` input](https://github.com/docker/build-push-action/blob/10e90e3645eae34f1e60eeb005ba3a3d33f178e8/action.yml#L84-L86),
+using secret ID `npm_token`. With the default `false`, that input is empty and no npm secret is
+passed. No token is added to build arguments, labels, outputs or persisted npm configuration.
+The caller must permit package reads. This combined build/publish workflow already requires
+`packages: write` on calling jobs, which includes read access; `packages: read` alone fails its
+existing static permission check even for `push-mode: none` (see [Why callers have no fork job](#why-callers-have-no-fork-job)).
+
+Copy the committed placeholder `.npmrc` into the dependency stage before installing. Keep the
+caller's pinned Node/pnpm setup, manifests and workspace files. Use this install instruction:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+# In the dependency stage, after copying package manifests and pnpm-lock.yaml:
+COPY .npmrc ./
+RUN --mount=type=secret,id=npm_token,required=true \
+    NODE_AUTH_TOKEN="$(cat /run/secrets/npm_token)" pnpm install --frozen-lockfile
+```
+
+This file mount sets `NODE_AUTH_TOKEN` for that command only; the mount is not committed to an
+image layer. Never use `ARG`/`ENV` for the token, expand the placeholder into a file, copy the
+secret mount, or enable shell tracing / print the token. Package install scripts run with this
+credential, so enable auth only for trusted consumer code and dependencies. Keep the existing
+same-repository preview boundary; do not widen it to fork PRs or privileged PR events.
+
+Docker's [`env=` secret mount](https://docs.docker.com/reference/dockerfile/#run---mounttypesecret)
+requires Dockerfile frontend 1.10.0 or later. The [pinned setup-buildx action](https://github.com/docker/setup-buildx-action/blob/8d2750c68a42422c14e847fe6c8ac0403b4cbd6f/action.yml)
+does not pin the BuildKit image or Dockerfile frontend in this workflow. Use the file mount above
+as the compatibility pattern. After verifying the consumer's frontend and builder support it,
+the equivalent environment mount is:
+
+```dockerfile
+RUN --mount=type=secret,id=npm_token,env=NODE_AUTH_TOKEN,required=true pnpm install --frozen-lockfile
+```
+
+### CI installs outside Docker
+
+In the consumer's existing CI job, add `packages: read` and set the token only on install steps.
+Retain its pinned checkout, Node and pnpm setup before these steps:
+
+```yaml
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      # Keep the existing pinned checkout and Node/pnpm setup here.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### Owner setup after first publish
+
+For **each** published package, open its settings and use **Manage Actions access** →
+**Add repository** to grant the consumer repositories **Read** access: wiki first, then
+tower-apps and iblonda-apps as they adopt the packages. This grant is on each npm package, not
+the shared workflow repository or the GHCR image. Workflow token permissions alone do not grant
+cross-repository access. GitHub documents this [package access configuration](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#ensuring-workflow-access-to-your-package)
+and [npm authentication with GITHUB_TOKEN](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry#authenticating-to-github-packages).
+No PAT, inherited secret or organization credential is required.
+
+Verify a clean CI install and an uncached native image install in the consumer after granting
+access; offline repository checks cannot prove package authorization or absence of credential
+leaks from consumer install scripts. Review logs, image history and provenance without printing
+the token. To stop passing it, remove `npm-registry-auth` or set it to `false`.
 
 ## Wiki caller (fixed app)
 
@@ -144,6 +231,7 @@ jobs:
       dockerfile: portal/Dockerfile
       context: .
       push-mode: main
+      npm-registry-auth: true
       build-args: |
         WIKI_BUILD_NUMBER=${{ needs.build-meta.outputs.number }}
         WIKI_BUILD_DATE=${{ needs.build-meta.outputs.date }}
@@ -164,6 +252,7 @@ jobs:
       dockerfile: portal/Dockerfile
       context: .
       push-mode: preview
+      npm-registry-auth: true
       build-args: |
         WIKI_BUILD_NUMBER=${{ needs.build-meta.outputs.number }}
         WIKI_BUILD_DATE=${{ needs.build-meta.outputs.date }}

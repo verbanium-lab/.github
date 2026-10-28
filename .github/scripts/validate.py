@@ -235,7 +235,7 @@ def validate_reusable(workflow, kind):
         require(set(jobs) == {"plan", "build", "push", "merge"}, "image job boundary required")
         require(not call.get("secrets"), "image workflow must not accept secrets")
         require(call.get("inputs", {}).get("push-mode", {}).get("default") == "none", "build-only default required")
-        permissions = {"plan": {}, "build": {"contents": "read"},
+        permissions = {"plan": {}, "build": {"contents": "read", "packages": "read"},
                        "push": {"contents": "read", "packages": "write"}, "merge": {"packages": "write"}}
         for name, expected in permissions.items():
             require(jobs[name].get("permissions", {}) == expected, "image job permission boundary required")
@@ -247,6 +247,9 @@ def validate_reusable(workflow, kind):
         declared = call.get("inputs", {}).get("build-args", {})
         require(declared.get("type") == "string" and declared.get("default") == "" and not declared.get("required"),
                 "optional string build-args input required")
+        auth = call.get("inputs", {}).get("npm-registry-auth", {})
+        require(auth.get("type") == "boolean" and auth.get("default") is False and not auth.get("required"),
+                "optional default-off npm registry auth required")
         require(jobs["plan"]["outputs"].get("build-args") == "${{ steps.plan.outputs.build-args }}",
                 "validated build-args output required")
         # The raw input may enter only the plan step's env; every other use is an injection path.
@@ -268,6 +271,9 @@ def validate_reusable(workflow, kind):
                     options = step.get("with", {})
                     require(options.get("build-args") == "${{ needs.plan.outputs.build-args }}",
                             "build-args only from the validated plan output")
+                    require(options.get("secrets") == "${{ inputs.npm-registry-auth && format('npm_token={0}', github.token) || '' }}"
+                            and not ({"secret-envs", "secret-files"} & options.keys()),
+                            "npm token must use only the opt-in BuildKit secret")
                     require(options.get("provenance") == "mode=max" and options.get("sbom") is True,
                             "image attachments required")
                     if name == "build":

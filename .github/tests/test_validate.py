@@ -221,6 +221,36 @@ class DefaultsTests(unittest.TestCase):
             with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
                 validator.validate_reusable(workflow, 'image')
 
+    def test_image_npm_auth_is_optional_and_default_off(self):
+        workflow = self.reusable('image')
+        auth = workflow[True]['workflow_call']['inputs']['npm-registry-auth']
+        for change in ({'default': True}, {'default': 'false'}, {'type': 'string'}, {'required': True}):
+            bad = copy.deepcopy(workflow)
+            bad[True]['workflow_call']['inputs']['npm-registry-auth'] = {**auth, **change}
+            with self.subTest(change=change), self.assertRaisesRegex(validator.Invalid, 'default-off'):
+                validator.validate_reusable(bad, 'image')
+        del workflow[True]['workflow_call']['inputs']['npm-registry-auth']
+        with self.assertRaisesRegex(validator.Invalid, 'default-off'):
+            validator.validate_reusable(workflow, 'image')
+
+    def test_image_npm_token_cannot_become_a_build_argument(self):
+        for job in ('build', 'push'):
+            for key, value in (
+                ('build-args', 'NODE_AUTH_TOKEN=${{ secrets.GITHUB_TOKEN }}'),
+                ('build-args', "${{ inputs.npm-registry-auth && format('NPM_TOKEN={0}', github.token) || '' }}"),
+                ('secrets', 'npm_token=${{ github.token }}'),
+                ('secrets', 'npm_token=${{ secrets.OTHER_TOKEN }}'),
+                ('secrets', ''),
+                ('secret-envs', 'npm_token=NODE_AUTH_TOKEN'),
+                ('secret-files', 'npm_token=.npmrc'),
+            ):
+                workflow = self.reusable('image')
+                step = next(s for s in workflow['jobs'][job]['steps']
+                            if s.get('uses', '').startswith('docker/build-push-action@'))
+                step['with'][key] = value
+                with self.subTest(job=job, key=key, value=value), self.assertRaises(validator.Invalid):
+                    validator.validate_reusable(workflow, 'image')
+
     def test_cleanup_default_and_retention_rejections(self):
         for mutate in (
             lambda w: w[True]['workflow_call']['inputs']['dry-run'].update(default=False),
