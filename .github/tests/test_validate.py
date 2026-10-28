@@ -111,6 +111,16 @@ class DefaultsTests(unittest.TestCase):
                 with self.assertRaises(validator.Invalid):
                     validator.validate_entry(path, mode, size)
 
+    def test_retired_package_scope(self):
+        # Built from parts so this file does not trip the guard it tests.
+        retired = "@verbanium" + "/tower"
+        for text in ("pnpm --filter @verbanium-lab/tower", "* @verbanium\n", "ops@verbanium.dev"):
+            validator.validate_package_scope("docs/reusable-workflows.md", text)
+        validator.validate_package_scope("pnpm-lock.yaml", retired)
+        for text in ("pnpm --filter " + retired, "/@verbanium" + "\\/tower/"):
+            with self.subTest(text=text), self.assertRaisesRegex(validator.Invalid, "retired package scope"):
+                validator.validate_package_scope("docs/reusable-workflows.md", text)
+
     def test_actual_git_index_rejects_unapproved_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             subprocess.run(["git", "init", "-q", tmp], check=True)

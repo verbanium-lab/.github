@@ -30,6 +30,8 @@ FIELDS = {
     "size": ("dropdown", "Size", ["S", "M", "L"]),
     "risk": ("dropdown", "Risk", ["low", "high"]),
 }
+# Retired npm scope: "@verbanium" followed by a slash, also regex-escaped. Packages use @verbanium-lab.
+RETIRED_SCOPE = re.compile(r"@verbanium\\?/")
 
 
 class Invalid(ValueError):
@@ -178,6 +180,11 @@ def validate_files(root):
     return paths
 
 
+def validate_package_scope(path, text):
+    if path != "pnpm-lock.yaml":
+        require(not RETIRED_SCOPE.search(text), f"retired package scope in {path}; use @verbanium-lab")
+
+
 def validate_workflow(workflow):
     require(isinstance(workflow, dict), "workflow must be a mapping")
     # SafeLoader uses YAML 1.1, where an unquoted `on` key is the boolean True.
@@ -307,6 +314,8 @@ def main():
     root = Path(__file__).resolve().parents[2]
     try:
         paths = validate_files(root)
+        for path in paths:
+            validate_package_scope(path, (root / path).read_text(encoding="utf-8"))
         validate_form(load_yaml(root / ".github/ISSUE_TEMPLATE/task.yml"))
         validate_config(load_yaml(root / ".github/ISSUE_TEMPLATE/config.yml"))
         validate_pr((root / ".github/pull_request_template.md").read_text())

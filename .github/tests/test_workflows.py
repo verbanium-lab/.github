@@ -224,7 +224,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 exec(compile(RETENTION, '<retention>', 'exec'), {})
 
     def test_affected_recipe_selects_known_apps_and_handles_empty(self):
-        for names, expected in ((['@verbanium/tower'], 1), ([], 0), (['@other/unknown'], 0)):
+        for names, expected in ((['@verbanium-lab/tower'], 1), ([], 0), (['@other/unknown'], 0)):
             with self.subTest(names=names), tempfile.TemporaryDirectory() as directory:
                 (Path(directory) / 'affected.json').write_text(json.dumps({
                     'packages': {'items': [{'name': name} for name in names]}}))
@@ -238,7 +238,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 self.assertEqual(values['has-apps'], str(bool(expected)).lower())
 
     def test_affected_recipe_rejects_unknown_schema(self):
-        for data in ({'packages': []}, {'packages': {'items': ['@verbanium/tower']}}):
+        for data in ({'packages': []}, {'packages': {'items': ['@verbanium-lab/tower']}}):
             with tempfile.TemporaryDirectory() as directory:
                 (Path(directory) / 'affected.json').write_text(json.dumps(data))
                 result = subprocess.run([sys.executable, '-c', AFFECTED],
