@@ -2,7 +2,7 @@
 title: Reusable image builds and registry cleanup
 owner: verbanium
 status: draft
-last_reviewed: 2026-10-28
+last_reviewed: 2026-10-29
 ---
 
 # Reusable image builds and registry cleanup
@@ -428,7 +428,7 @@ Unknown tagged versions are not selected. Keep cleanup serialized per package, a
 the pinned action's dry-run shows no retained index losing a referenced manifest or attestation.
 
 Before enabling deletion, every digest running in any environment must have a `deployed-*`
-protection tag. Maintaining those tags is Tower's follow-up responsibility. Keep dry-run enabled
+protection tag, moved by [`deployed-tag.yml`](#protect-the-deployed-digest). Keep dry-run enabled
 until this protection exists. The latest-ten rule alone cannot protect every running digest.
 
 There is a deliberate limit: the action's age filter uses package-version age, **not the time a
@@ -436,6 +436,77 @@ PR closed**. An open preview older than 14 days can be selected. This implements
 policy; ADR 0009's stronger “14 days after closure” rule needs PR lifecycle tracking in a follow-up.
 Also verify how reusing a digest with several SHA aliases affects creation-age retention; the
 policy protects at least ten recent sha-tagged versions and all their SHA aliases.
+
+## Protect the deployed digest
+
+Owner decision of 2026-10-28: registry retention for app images (tower, iblonda, landing) is
+switched on only after the running digest of each environment carries a `deployed-<env>` tag.
+`ghcr-cleanup.yml` already excludes `deployed-*`; `.github/workflows/deployed-tag.yml` moves the tag.
+
+When to run it: right after every Coolify deploy by digest, and after every rollback, with the
+digest that now runs. The latest-ten `sha-*` rule protects a digest only while it is recent. An
+environment that stays on one digest for weeks would lose it to the 30-day `sha-*` cleanup, and the
+next restart, scale-out or rollback would fail to pull. A moved tag releases the previous digest
+to normal retention.
+
+Caller: copy this into the app repository as `.github/workflows/deployed-tag.yml`. Pin
+`REVIEWED_WORKFLOW_COMMIT` to a reviewed full commit SHA. The calling job grants `contents: read`
+and `packages: write`, as the reusable job requests exactly these.
+
+```yaml
+name: Deployed tag
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Image without tag or digest, e.g. ghcr.io/verbanium-lab/iblonda-web
+        required: true
+        type: string
+      digest:
+        description: Deployed OCI index digest, sha256:<64 hex>
+        required: true
+        type: string
+      env:
+        description: Environment that runs this digest
+        required: true
+        type: choice
+        options: [dev, rc, prod]
+permissions: {}
+jobs:
+  deployed-tag:
+    permissions:
+      contents: read
+      packages: write
+    uses: verbanium-lab/.github/.github/workflows/deployed-tag.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      image: ${{ inputs.image }}
+      digest: ${{ inputs.digest }}
+      env: ${{ inputs.env }}
+```
+
+The `image` is a full `ghcr.io/verbanium-lab/...` name without a tag or digest; `digest` is the OCI
+index digest that was deployed (the `digest` output of `image.yml`, or the digest in the Coolify
+image reference); `env` is `dev`, `rc` or `prod`.
+
+What the workflow does:
+
+- Fails closed unless the image is under `ghcr.io/verbanium-lab/` in lowercase, the digest matches
+  `sha256:` plus 64 lowercase hex characters and `env` is one of the three values. The inputs reach
+  the validation script through `env`, never through an expression inside `run`. It also requires a
+  `workflow_dispatch` on the default branch of a `verbanium-lab` repository, like the cleanup workflow's
+  main-only boundary.
+- Runs `docker buildx imagetools create --tag <image>:deployed-<env> <image>@<digest>`. This copies
+  the manifest by digest: no layers are pulled and the OCI index, with its per-platform manifests,
+  provenance and SBOM, is kept.
+- Runs `docker buildx imagetools inspect <image>:deployed-<env>` and fails unless the top digest equals
+  the input digest. The job summary shows the tag, the expected digest and the tag's digest.
+- Uses only the job's `GITHUB_TOKEN` with `contents: read` and `packages: write`; no checkout and no
+  secret. The package must grant the calling repository write access, as for `image.yml`.
+- Serializes moves per image and environment; a newer waiting request replaces an older waiting one.
+
+Not verified offline: that `imagetools create` from a single index source returns an identical
+index digest. The check after the move fails the job if it does not. Confirm it in the first real
+caller run, then record the evidence in the retention rollout.
 
 ## Verification and recovery
 

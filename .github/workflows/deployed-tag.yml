@@ -1,0 +1,144 @@
+name: Reusable deployed tag
+
+# Moves the `deployed-<env>` tag of an image to the digest that runs in that environment, so the
+# registry retention in ghcr-cleanup.yml never deletes a running digest. Run it right after every
+# deploy by digest and after every rollback. Retagging copies only the manifest: no layers are
+# pulled and the OCI index (multi-arch, provenance, SBOM) is kept, so the tag points at the same
+# digest that was deployed.
+#
+# Caller example: add this file to the app repository as .github/workflows/deployed-tag.yml.
+# Pin the reusable workflow by a reviewed full commit SHA instead of REVIEWED_WORKFLOW_COMMIT.
+# The workflow only runs for a workflow_dispatch on the default branch of a verbanium-lab repository.
+#
+#   name: Deployed tag
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         image:
+#           description: Image without tag or digest, e.g. ghcr.io/verbanium-lab/iblonda-web
+#           required: true
+#           type: string
+#         digest:
+#           description: Deployed OCI index digest, sha256:<64 hex>
+#           required: true
+#           type: string
+#         env:
+#           description: Environment that runs this digest
+#           required: true
+#           type: choice
+#           options: [dev, rc, prod]
+#   permissions: {}
+#   jobs:
+#     deployed-tag:
+#       permissions:
+#         contents: read
+#         packages: write
+#       uses: verbanium-lab/.github/.github/workflows/deployed-tag.yml@REVIEWED_WORKFLOW_COMMIT
+#       with:
+#         image: ${{ inputs.image }}
+#         digest: ${{ inputs.digest }}
+#         env: ${{ inputs.env }}
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Full lowercase ghcr.io/verbanium-lab image name, without a tag or digest
+        required: true
+        type: string
+      digest:
+        description: Deployed OCI index digest, sha256 followed by 64 lowercase hex characters
+        required: true
+        type: string
+      env:
+        description: Environment that runs the digest; dev, rc or prod
+        required: true
+        type: string
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+# One tag move at a time per image and environment. A newer request replaces a waiting older one,
+# so the newest deploy wins; a running move is never cancelled half way.
+concurrency:
+  group: deployed-tag-${{ inputs.image }}-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Validate inputs and event boundary
+        id: plan
+        env:
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+          TARGET_ENV: ${{ inputs.env }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          def require(ok, message):
+              if not ok:
+                  raise SystemExit(message)
+
+          env = os.environ
+          require(env['OWNER'] == 'verbanium-lab', 'Organization repository required')
+          require(env['EVENT'] == 'workflow_dispatch', 'Manual dispatch required')
+          require(env['DEFAULT_REF'] != 'refs/heads/' and env['REF'] == env['DEFAULT_REF'],
+                  'Default branch required')
+          require(re.fullmatch(r'ghcr\.io/verbanium-lab/[a-z0-9]+(?:[._/-][a-z0-9]+)*', env['IMAGE']),
+                  'Invalid image name')
+          require(re.fullmatch(r'sha256:[0-9a-f]{64}', env['DIGEST']), 'Invalid digest')
+          require(env['TARGET_ENV'] in ('dev', 'rc', 'prod'), 'Invalid environment')
+          with open(env['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in {'image': env['IMAGE'], 'digest': env['DIGEST'],
+                                 'tag': 'deployed-' + env['TARGET_ENV']}.items():
+                  print(f'{key}={value}', file=output)
+          PY
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Retag the deployed digest and verify
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
+          DIGEST: ${{ steps.plan.outputs.digest }}
+          TAG: ${{ steps.plan.outputs.tag }}
+        run: |
+          # Revalidate: this step must not trust earlier step output.
+          [[ "$IMAGE" =~ ^ghcr\.io/verbanium-lab/[a-z0-9]+([._/-][a-z0-9]+)*$ ]]
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$TAG" =~ ^deployed-(dev|rc|prod)$ ]]
+          # Manifest copy by digest: no layer pull, and the OCI index is kept as it is.
+          docker buildx imagetools create --tag "$IMAGE:$TAG" "$IMAGE@$DIGEST"
+          actual="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
+          {
+            echo "### Deployed tag"
+            echo
+            echo "- Tag: \`$IMAGE:$TAG\`"
+            echo "- Expected digest: \`$DIGEST\`"
+            echo "- Tag digest: \`$actual\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$actual" != "$DIGEST" ]]; then
+            echo "::error::$TAG does not point at the requested digest"
+            exit 1
+          fi
+          echo "- Result: match" >> "$GITHUB_STEP_SUMMARY"
+      - name: Log out of GHCR
+        if: ${{ always() }}
+        run: docker logout ghcr.io

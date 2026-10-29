@@ -152,7 +152,7 @@ class DefaultsTests(unittest.TestCase):
                     validator.validate_workflow(bad)
 
     def reusable(self, kind):
-        name = 'image' if kind == 'image' else 'ghcr-cleanup'
+        name = {'image': 'image', 'cleanup': 'ghcr-cleanup', 'deployed': 'deployed-tag'}[kind]
         workflow = validator.load_yaml(ROOT / f'.github/workflows/{name}.yml')
         # Synthetic pinned references isolate boundary rejection tests from the offline pin gate.
         for job in workflow['jobs'].values():
@@ -163,7 +163,7 @@ class DefaultsTests(unittest.TestCase):
         return workflow
 
     def test_reusable_rejects_unpinned_actions_and_interpolation(self):
-        for kind in ('image', 'cleanup'):
+        for kind in ('image', 'cleanup', 'deployed'):
             workflow = self.reusable(kind)
             for job in workflow['jobs'].values():
                 for step in job.get('steps', []):
@@ -275,6 +275,30 @@ class DefaultsTests(unittest.TestCase):
             mutate(workflow)
             with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
                 validator.validate_reusable(workflow, 'cleanup')
+
+    def test_deployed_tag_boundary_rejections(self):
+        for mutate in (
+            lambda w: w.update(on={'pull_request_target': None}),
+            lambda w: w.update(permissions={'contents': 'read'}),
+            lambda w: w['jobs']['tag'].update(permissions={'contents': 'write', 'packages': 'write'}),
+            lambda w: w['jobs']['tag'].update(permissions={'packages': 'write'}),
+            lambda w: w['jobs']['tag'].update({'if': '${{ true }}'}),
+            lambda w: w['jobs']['tag'].update({'continue-on-error': True}),
+            lambda w: w['jobs']['tag']['steps'][0].update({'if': '${{ false }}'}),
+            lambda w: w['jobs']['tag']['steps'][0]['env'].update(IMAGE='ghcr.io/verbanium-lab/x'),
+            lambda w: w['jobs']['tag']['steps'][0]['env'].pop('DIGEST'),
+            lambda w: w['jobs']['tag']['steps'][3]['env'].update(DIGEST='${{ inputs.digest }}'),
+            lambda w: w['jobs']['tag']['steps'][3].update(run='docker pull "$IMAGE@$DIGEST"'),
+            lambda w: w['jobs']['tag']['steps'].insert(0, {'run': 'true'}),
+            lambda w: w[True]['workflow_call'].update(secrets={'token': {'required': False}}),
+            lambda w: w[True]['workflow_call']['inputs'].pop('env'),
+            lambda w: w[True]['workflow_call']['inputs']['env'].update(default='prod'),
+            lambda w: w[True]['workflow_call']['inputs']['digest'].update(required=False),
+        ):
+            workflow = self.reusable('deployed')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'deployed')
 
     def test_secret_fixture_is_rejected_and_redacted(self):
         # Construct a recognizable, deliberately fake token only in a temporary file.

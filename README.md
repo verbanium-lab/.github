@@ -2,7 +2,7 @@
 title: Public organization defaults
 owner: verbanium
 status: active
-last_reviewed: 2026-10-27
+last_reviewed: 2026-10-29
 ---
 
 # .github
@@ -28,7 +28,58 @@ local check and the owner-controlled activation steps.
 | --- | --- |
 | [image.yml](.github/workflows/image.yml) | Native amd64/arm64 builds, main and same-repository preview publication, provenance and SBOM |
 | [ghcr-cleanup.yml](.github/workflows/ghcr-cleanup.yml) | Per-package retention with protected release/deployed tags; dry-run by default |
+| [deployed-tag.yml](.github/workflows/deployed-tag.yml) | Moves `deployed-<env>` to the digest that runs in an environment, without pulling layers |
 
 See [caller recipes and adoption requirements](docs/reusable-workflows.md) for fixed-app wiki and
 affected-matrix Tower examples, release-commit filters and token boundaries. Unresolved action pins
 must be completed before adoption. This change does not migrate any app caller.
+
+## Protect the deployed digest
+
+Registry retention deletes old `sha-*` versions, and the newest ten alone do not cover a digest that
+has been running for weeks. `ghcr-cleanup.yml` keeps every `deployed-*` tag, so retention for app
+images (tower, iblonda, landing) may be switched on only after the running digest of each
+environment carries `deployed-<env>` (`dev`, `rc` or `prod`).
+
+Run the tag move right after every Coolify deploy by digest, and again after every rollback (with
+the digest that now runs). Without it, the running digest is protected only while it is among the
+newest ten `sha-*` versions, and it can be deleted later; the next restart or rollback then fails.
+
+An app repository adds `.github/workflows/deployed-tag.yml`, a manual workflow that calls the
+reusable one. Pin the reusable workflow by a reviewed full commit SHA in place of
+`REVIEWED_WORKFLOW_COMMIT`:
+
+```yaml
+name: Deployed tag
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Image without tag or digest, e.g. ghcr.io/verbanium-lab/iblonda-web
+        required: true
+        type: string
+      digest:
+        description: Deployed OCI index digest, sha256:<64 hex>
+        required: true
+        type: string
+      env:
+        description: Environment that runs this digest
+        required: true
+        type: choice
+        options: [dev, rc, prod]
+permissions: {}
+jobs:
+  deployed-tag:
+    permissions:
+      contents: read
+      packages: write
+    uses: verbanium-lab/.github/.github/workflows/deployed-tag.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      image: ${{ inputs.image }}
+      digest: ${{ inputs.digest }}
+      env: ${{ inputs.env }}
+```
+
+Run it from the default branch with the image, the deployed `sha256:` digest and the environment.
+Inputs are validated strictly and the job fails if the tag does not resolve to the digest afterwards.
+See [the guide](docs/reusable-workflows.md#protect-the-deployed-digest).
