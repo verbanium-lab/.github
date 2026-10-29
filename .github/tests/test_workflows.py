@@ -47,6 +47,7 @@ def github_output(text):
 
 PLAN = embedded_python('.github/workflows/image.yml', 'Validate inputs and publication boundary')
 MERGE = embedded_python('.github/workflows/image.yml', 'Merge and inspect OCI index')
+DEPLOYED = embedded_python('.github/workflows/deployed-tag.yml', 'Validate inputs and event boundary')
 RETENTION = embedded_python('.github/workflows/ghcr-cleanup.yml', 'Protect the latest ten sha tags')
 AFFECTED = embedded_python('docs/reusable-workflows.md', 'Select affected images')
 
@@ -170,6 +171,48 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 if success:
                     sources = (Path(directory) / 'sources.txt').read_text().splitlines()
                     self.assertEqual(sources, ['ghcr.io/verbanium-lab/wiki@sha256:' + c * 64 for c in ('a', 'b')])
+
+    def deployed(self, **changes):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'output'
+            env = dict(IMAGE='ghcr.io/verbanium-lab/iblonda-web', DIGEST='sha256:' + 'a' * 64, TARGET_ENV='prod',
+                       EVENT='workflow_dispatch', REF='refs/heads/main', DEFAULT_REF='refs/heads/main',
+                       OWNER='verbanium-lab', GITHUB_OUTPUT=str(output))
+            env.update(changes)
+            result = subprocess.run([sys.executable, '-c', DEPLOYED], env=env, capture_output=True, text=True)
+            values = github_output(output.read_text()) if output.exists() else {}
+            return result, values
+
+    def test_deployed_tag_accepts_each_environment(self):
+        for target in ('dev', 'rc', 'prod'):
+            with self.subTest(target=target):
+                result, values = self.deployed(TARGET_ENV=target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values, {'image': 'ghcr.io/verbanium-lab/iblonda-web',
+                                          'digest': 'sha256:' + 'a' * 64, 'tag': 'deployed-' + target})
+
+    def test_deployed_tag_rejects_malformed_inputs_and_events(self):
+        for changes in (
+            dict(TARGET_ENV='production'), dict(TARGET_ENV=''), dict(TARGET_ENV='prod\ninjected=value'),
+            dict(TARGET_ENV='Prod'), dict(TARGET_ENV='dev '),
+            dict(DIGEST='sha256:' + 'a' * 63), dict(DIGEST='sha256:' + 'a' * 65), dict(DIGEST='sha256:' + 'A' * 64),
+            dict(DIGEST='sha512:' + 'a' * 64), dict(DIGEST='a' * 64), dict(DIGEST='sha256:' + 'a' * 64 + '\n'),
+            dict(DIGEST=''), dict(DIGEST='sha256:' + 'a' * 64 + '\ninjected=value'),
+            dict(IMAGE='ghcr.io/other/iblonda-web'), dict(IMAGE='docker.io/verbanium-lab/iblonda-web'),
+            dict(IMAGE='ghcr.io/verbanium-lab/iblonda-web:latest'),
+            dict(IMAGE='ghcr.io/verbanium-lab/iblonda-web@sha256:' + 'a' * 64),
+            dict(IMAGE='ghcr.io/verbanium-lab/Iblonda-web'), dict(IMAGE='ghcr.io/verbanium-lab/'),
+            dict(IMAGE='ghcr.io/verbanium-lab/../other/x'), dict(IMAGE='ghcr.io/verbanium-lab/web\ninjected=value'),
+            dict(IMAGE=''),
+            dict(EVENT='push'), dict(EVENT='pull_request'), dict(EVENT='pull_request_target'),
+            dict(REF='refs/heads/feature'), dict(REF='refs/pull/1/merge'),
+            dict(DEFAULT_REF='refs/heads/', REF='refs/heads/'),
+            dict(OWNER='other'),
+        ):
+            with self.subTest(changes=changes):
+                result, values = self.deployed(**changes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {})
 
     def retention(self, pages, package='wiki'):
         with tempfile.TemporaryDirectory() as directory:

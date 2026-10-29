@@ -19,6 +19,7 @@ OWNED_FILES = {
     ".github/scripts/check.sh", ".github/scripts/install-tool.sh",
     ".github/scripts/requirements.txt", ".github/tests/test_validate.py",
     ".github/workflows/image.yml", ".github/workflows/ghcr-cleanup.yml",
+    ".github/workflows/deployed-tag.yml",
     ".github/tests/test_workflows.py", "docs/reusable-workflows.md",
 }
 FIELDS = {
@@ -220,6 +221,7 @@ def validate_reusable(workflow, kind):
         "image": {"actions/checkout", "docker/setup-buildx-action", "docker/build-push-action",
                   "actions/upload-artifact", "actions/download-artifact"},
         "cleanup": {"dataaxiom/ghcr-cleanup-action"},
+        "deployed": {"docker/setup-buildx-action"},
     }[kind]
     for job in jobs.values():
         require(isinstance(job, dict) and "uses" not in job, "local reusable jobs required")
@@ -290,6 +292,31 @@ def validate_reusable(workflow, kind):
                         require("push-by-digest=true" in options.get("outputs", ""), "digest publication required")
                         require(options.get("cache-to", "").startswith("${{ inputs.push-mode == 'main' &&"),
                                 "only main may save publishing caches")
+    elif kind == "deployed":
+        require(set(jobs) == {"tag"}, "one tag job required")
+        require(not call.get("secrets"), "deployed-tag workflow must not accept secrets")
+        declared = call.get("inputs", {})
+        require(set(declared) == {"image", "digest", "env"}, "image, digest and env inputs required")
+        require(all(i.get("type") == "string" and i.get("required") is True and "default" not in i
+                    for i in declared.values()), "required string inputs without defaults")
+        require(jobs["tag"].get("permissions") == {"contents": "read", "packages": "write"},
+                "tag permission boundary required")
+        require("if" not in jobs["tag"] and "needs" not in jobs["tag"], "tag job must always run alone")
+        steps = jobs["tag"].get("steps", [])
+        require(steps and all("if" not in s or s.get("name") == "Log out of GHCR" for s in steps),
+                "tag steps must not be skipped")
+        # Inputs may enter only the validation step's env; later steps read the validated outputs.
+        for step in steps:
+            used = repr({k: v for k, v in step.items() if not (step.get("id") == "plan" and k == "env")})
+            require("inputs." not in used, "raw inputs may only enter the validation step through env")
+        plan = next((s for s in steps if s.get("id") == "plan"), None)
+        require(plan is not None and steps[0] is plan, "validation must run first")
+        require({plan["env"].get(k) for k in ("IMAGE", "DIGEST", "TARGET_ENV")}
+                == {"${{ inputs.image }}", "${{ inputs.digest }}", "${{ inputs.env }}"},
+                "validation must read inputs through env")
+        retag = " ".join(s.get("run", "") for s in steps)
+        require("docker buildx imagetools create --tag" in retag and "imagetools inspect" in retag
+                and "docker pull" not in retag, "manifest retag and verification required")
     else:
         require(set(jobs) == {"cleanup"}, "one cleanup job required")
         require(call.get("inputs", {}).get("dry-run", {}).get("default") is True, "cleanup dry-run default required")
@@ -323,6 +350,7 @@ def main():
         validate_workflow(load_yaml(root / ".github/workflows/ci.yml"))
         validate_reusable(load_yaml(root / ".github/workflows/image.yml"), "image")
         validate_reusable(load_yaml(root / ".github/workflows/ghcr-cleanup.yml"), "cleanup")
+        validate_reusable(load_yaml(root / ".github/workflows/deployed-tag.yml"), "deployed")
         if args.snapshot:
             for path in paths:
                 target = args.snapshot / path
