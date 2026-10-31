@@ -20,6 +20,9 @@ OWNED_FILES = {
     ".github/scripts/requirements.txt", ".github/tests/test_validate.py",
     ".github/workflows/image.yml", ".github/workflows/ghcr-cleanup.yml",
     ".github/workflows/deployed-tag.yml", ".github/workflows/release.yml",
+    ".github/workflows/status.yml",
+    ".github/scripts/collect_status.py", ".github/scripts/render_status.py",
+    ".github/tests/test_status.py",
     ".github/tests/test_workflows.py", "docs/reusable-workflows.md",
 }
 FIELDS = {
@@ -223,6 +226,7 @@ def validate_reusable(workflow, kind):
         "cleanup": {"dataaxiom/ghcr-cleanup-action"},
         "deployed": {"docker/setup-buildx-action"},
         "release": {"actions/checkout"},
+        "status": {"actions/checkout", "actions/download-artifact"},
     }[kind]
     for job in jobs.values():
         require(isinstance(job, dict) and "uses" not in job, "local reusable jobs required")
@@ -297,10 +301,15 @@ def validate_reusable(workflow, kind):
         require(set(jobs) == {"tag"}, "one tag job required")
         require(not call.get("secrets"), "deployed-tag workflow must not accept secrets")
         declared = call.get("inputs", {})
-        require(set(declared) == {"image", "digest", "env"}, "image, digest and env inputs required")
-        require(all(i.get("type") == "string" and i.get("required") is True and "default" not in i
-                    for i in declared.values()), "required string inputs without defaults")
-        require(jobs["tag"].get("permissions") == {"contents": "read", "packages": "write"},
+        require(set(declared) == {"image", "digest", "env", "release"}, "image, digest, env and release inputs required")
+        for name in ("image", "digest", "env"):
+            field = declared[name]
+            require(field.get("type") == "string" and field.get("required") is True and "default" not in field,
+                    "required string inputs without defaults")
+        release = declared["release"]
+        require(release.get("type") == "string" and release.get("default") == "" and not release.get("required"),
+                "optional release input required")
+        require(jobs["tag"].get("permissions") == {"contents": "read", "packages": "write", "deployments": "write"},
                 "tag permission boundary required")
         require("if" not in jobs["tag"] and "needs" not in jobs["tag"], "tag job must always run alone")
         steps = jobs["tag"].get("steps", [])
@@ -312,12 +321,16 @@ def validate_reusable(workflow, kind):
             require("inputs." not in used, "raw inputs may only enter the validation step through env")
         plan = next((s for s in steps if s.get("id") == "plan"), None)
         require(plan is not None and steps[0] is plan, "validation must run first")
-        require({plan["env"].get(k) for k in ("IMAGE", "DIGEST", "TARGET_ENV")}
-                == {"${{ inputs.image }}", "${{ inputs.digest }}", "${{ inputs.env }}"},
+        require({plan["env"].get(k) for k in ("IMAGE", "DIGEST", "TARGET_ENV", "RELEASE")}
+                == {"${{ inputs.image }}", "${{ inputs.digest }}", "${{ inputs.env }}", "${{ inputs.release }}"},
                 "validation must read inputs through env")
         retag = " ".join(s.get("run", "") for s in steps)
         require("docker buildx imagetools create --tag" in retag and "imagetools inspect" in retag
                 and "docker pull" not in retag, "manifest retag and verification required")
+        require(any(s.get("name") == "Record GitHub Deployment" for s in steps), "deployment record step required")
+        deployment = next(s for s in steps if s.get("name") == "Record GitHub Deployment")
+        require("gh" in deployment.get("run", "") and "deployments" in deployment.get("run", ""),
+                "gh deployment API required")
     elif kind == "release":
         require(set(jobs) == {"release"}, "one release job required")
         declared = call.get("inputs", {})
@@ -356,6 +369,33 @@ def validate_reusable(workflow, kind):
         require("curl --fail-with-body" in telegram.get("run", ""), "telegram curl boundary required")
         outputs = call.get("outputs", {})
         require(set(outputs) == {"tag", "digest", "image", "slug", "release-url"}, "release outputs required")
+    elif kind == "status":
+        require(set(jobs) == {"status"}, "one status job required")
+        require(not call.get("secrets"), "status workflow must not accept secrets")
+        declared = call.get("inputs", {})
+        require(set(declared) == {"apps", "coverage-artifact"}, "apps and coverage-artifact inputs required")
+        apps = declared["apps"]
+        require(apps.get("type") == "string" and apps.get("required") is True and "default" not in apps,
+                "required apps JSON input required")
+        coverage = declared["coverage-artifact"]
+        require(coverage.get("type") == "string" and coverage.get("default") == "" and not coverage.get("required"),
+                "optional coverage-artifact input required")
+        require(jobs["status"].get("permissions") == {"contents": "write", "packages": "read", "deployments": "read"},
+                "status permission boundary required")
+        steps = jobs["status"].get("steps", [])
+        require(steps and all("continue-on-error" not in s for s in steps), "status steps must fail closed")
+        script_checkout = next((s for s in steps if s.get("name") == "Check out status scripts"), None)
+        require(script_checkout is not None and script_checkout.get("with", {}).get("repository") == "verbanium-lab/.github",
+                "status scripts checkout required")
+        require("collect_status.py" in repr(steps) and "render_status.py" in repr(steps),
+                "status data and render scripts required")
+        commit = next((s for s in steps if s.get("name") == "Commit status update"), None)
+        run = commit.get("run", "") if commit else ""
+        require(commit is not None and "chore(status): update README status [skip ci]" in run
+                and "Status-Update: automated" in run, "fixed status commit message required")
+        require("createCommitOnBranch" in run, "signed commit through createCommitOnBranch required")
+        require("git push" not in run, "status commit must not use git push")
+        require("gh', 'pr', 'create'" in run, "status PR fallback required")
     else:
         require(set(jobs) == {"cleanup"}, "one cleanup job required")
         require(call.get("inputs", {}).get("dry-run", {}).get("default") is True, "cleanup dry-run default required")
@@ -391,6 +431,7 @@ def main():
         validate_reusable(load_yaml(root / ".github/workflows/ghcr-cleanup.yml"), "cleanup")
         validate_reusable(load_yaml(root / ".github/workflows/deployed-tag.yml"), "deployed")
         validate_reusable(load_yaml(root / ".github/workflows/release.yml"), "release")
+        validate_reusable(load_yaml(root / ".github/workflows/status.yml"), "status")
         if args.snapshot:
             for path in paths:
                 target = args.snapshot / path

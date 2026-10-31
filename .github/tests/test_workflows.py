@@ -177,7 +177,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'output'
             env = dict(IMAGE='ghcr.io/verbanium-lab/iblonda-web', DIGEST='sha256:' + 'a' * 64, TARGET_ENV='prod',
-                       EVENT='workflow_dispatch', REF='refs/heads/main', DEFAULT_REF='refs/heads/main',
+                       RELEASE='', EVENT='workflow_dispatch', REF='refs/heads/main', DEFAULT_REF='refs/heads/main',
                        OWNER='verbanium-lab', GITHUB_OUTPUT=str(output))
             env.update(changes)
             result = subprocess.run([sys.executable, '-c', DEPLOYED], env=env, capture_output=True, text=True)
@@ -190,7 +190,9 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 result, values = self.deployed(TARGET_ENV=target)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(values, {'image': 'ghcr.io/verbanium-lab/iblonda-web',
-                                          'digest': 'sha256:' + 'a' * 64, 'tag': 'deployed-' + target})
+                                          'digest': 'sha256:' + 'a' * 64, 'tag': 'deployed-' + target,
+                                          'release': '', 'deployment-environment':
+                                          {'dev': 'dev', 'rc': 'rc', 'prod': 'production'}[target]})
 
     def test_deployed_tag_rejects_malformed_inputs_and_events(self):
         for changes in (

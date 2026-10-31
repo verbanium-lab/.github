@@ -152,7 +152,8 @@ class DefaultsTests(unittest.TestCase):
                     validator.validate_workflow(bad)
 
     def reusable(self, kind):
-        name = {'image': 'image', 'cleanup': 'ghcr-cleanup', 'deployed': 'deployed-tag'}[kind]
+        name = {'image': 'image', 'cleanup': 'ghcr-cleanup', 'deployed': 'deployed-tag',
+                'release': 'release', 'status': 'status'}[kind]
         workflow = validator.load_yaml(ROOT / f'.github/workflows/{name}.yml')
         # Synthetic pinned references isolate boundary rejection tests from the offline pin gate.
         for job in workflow['jobs'].values():
@@ -163,7 +164,7 @@ class DefaultsTests(unittest.TestCase):
         return workflow
 
     def test_reusable_rejects_unpinned_actions_and_interpolation(self):
-        for kind in ('image', 'cleanup', 'deployed'):
+        for kind in ('image', 'cleanup', 'deployed', 'release', 'status'):
             workflow = self.reusable(kind)
             for job in workflow['jobs'].values():
                 for step in job.get('steps', []):
@@ -280,8 +281,8 @@ class DefaultsTests(unittest.TestCase):
         for mutate in (
             lambda w: w.update(on={'pull_request_target': None}),
             lambda w: w.update(permissions={'contents': 'read'}),
-            lambda w: w['jobs']['tag'].update(permissions={'contents': 'write', 'packages': 'write'}),
-            lambda w: w['jobs']['tag'].update(permissions={'packages': 'write'}),
+            lambda w: w['jobs']['tag'].update(permissions={'contents': 'read', 'packages': 'write'}),
+            lambda w: w['jobs']['tag'].update(permissions={'packages': 'write', 'deployments': 'write'}),
             lambda w: w['jobs']['tag'].update({'if': '${{ true }}'}),
             lambda w: w['jobs']['tag'].update({'continue-on-error': True}),
             lambda w: w['jobs']['tag']['steps'][0].update({'if': '${{ false }}'}),
@@ -299,6 +300,21 @@ class DefaultsTests(unittest.TestCase):
             mutate(workflow)
             with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
                 validator.validate_reusable(workflow, 'deployed')
+
+    def test_status_boundary_rejections(self):
+        for mutate in (
+            lambda w: w.update(on={'pull_request_target': None}),
+            lambda w: w.update(permissions={'contents': 'read'}),
+            lambda w: w['jobs']['status'].update(permissions={'contents': 'write', 'packages': 'write'}),
+            lambda w: w['jobs']['status'].update(permissions={'contents': 'write', 'deployments': 'read'}),
+            lambda w: w[True]['workflow_call']['inputs'].pop('apps'),
+            lambda w: w[True]['workflow_call']['inputs']['coverage-artifact'].update(required=True),
+            lambda w: w['jobs']['status']['steps'].pop(1),
+        ):
+            workflow = self.reusable('status')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'status')
 
     def test_secret_fixture_is_rejected_and_redacted(self):
         # Construct a recognizable, deliberately fake token only in a temporary file.
