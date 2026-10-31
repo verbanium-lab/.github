@@ -29,6 +29,7 @@ local check and the owner-controlled activation steps.
 | [image.yml](.github/workflows/image.yml) | Native amd64/arm64 builds, main and same-repository preview publication, provenance and SBOM |
 | [ghcr-cleanup.yml](.github/workflows/ghcr-cleanup.yml) | Per-package retention with protected release/deployed tags; dry-run by default |
 | [deployed-tag.yml](.github/workflows/deployed-tag.yml) | Moves `deployed-<env>` to the digest that runs in an environment, without pulling layers |
+| [release.yml](.github/workflows/release.yml) | GitHub Release per main image build (`<slug>-<YYYY.MM.DD>-<sha7>`) and optional Telegram notify |
 
 See [caller recipes and adoption requirements](docs/reusable-workflows.md) for fixed-app wiki and
 affected-matrix Tower examples, release-commit filters and token boundaries. Unresolved action pins
@@ -83,3 +84,34 @@ jobs:
 Run it from the default branch with the image, the deployed `sha256:` digest and the environment.
 Inputs are validated strictly and the job fails if the tag does not resolve to the digest afterwards.
 See [the guide](docs/reusable-workflows.md#protect-the-deployed-digest).
+
+## Release after image (main)
+
+Pin `release.yml` by a reviewed full commit SHA. Run it in the caller repository on every successful
+main image publication. Pass the image workflow outputs and grant `contents: write` on the release job.
+Map the organization secret `TELEGRAM_RELEASES_BOT_TOKEN` when Telegram notifications are configured;
+organization variables `TELEGRAM_RELEASES_CHAT_ID` and `TELEGRAM_RELEASES_THREAD_ID` are read inside the
+reusable workflow. When the bot token is absent, Telegram is skipped with a notice and the release still
+succeeds.
+
+Example for `verbanium-apps` (`landing`):
+
+```yaml
+  release-landing:
+    name: release (landing)
+    needs: image-main
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.image-main.outputs.digest != '' }}
+    permissions:
+      contents: write
+    secrets:
+      TELEGRAM_RELEASES_BOT_TOKEN: ${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}
+    uses: verbanium-lab/.github/.github/workflows/release.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      slug: landing
+      image: ${{ needs.image-main.outputs.image }}
+      digest: ${{ needs.image-main.outputs.digest }}
+```
+
+Workflow outputs (`tag`, `digest`, `image`, `slug`, `release-url`) are available to downstream jobs.
+A future release-candidate auto-deploy workflow can read those outputs (and the release body digest line)
+after merge; opt-in from the pull request template is not part of this workflow yet.

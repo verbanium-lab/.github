@@ -19,7 +19,7 @@ OWNED_FILES = {
     ".github/scripts/check.sh", ".github/scripts/install-tool.sh",
     ".github/scripts/requirements.txt", ".github/tests/test_validate.py",
     ".github/workflows/image.yml", ".github/workflows/ghcr-cleanup.yml",
-    ".github/workflows/deployed-tag.yml",
+    ".github/workflows/deployed-tag.yml", ".github/workflows/release.yml",
     ".github/tests/test_workflows.py", "docs/reusable-workflows.md",
 }
 FIELDS = {
@@ -222,6 +222,7 @@ def validate_reusable(workflow, kind):
                   "actions/upload-artifact", "actions/download-artifact"},
         "cleanup": {"dataaxiom/ghcr-cleanup-action"},
         "deployed": {"docker/setup-buildx-action"},
+        "release": {"actions/checkout"},
     }[kind]
     for job in jobs.values():
         require(isinstance(job, dict) and "uses" not in job, "local reusable jobs required")
@@ -317,6 +318,44 @@ def validate_reusable(workflow, kind):
         retag = " ".join(s.get("run", "") for s in steps)
         require("docker buildx imagetools create --tag" in retag and "imagetools inspect" in retag
                 and "docker pull" not in retag, "manifest retag and verification required")
+    elif kind == "release":
+        require(set(jobs) == {"release"}, "one release job required")
+        declared = call.get("inputs", {})
+        require(set(declared) == {"slug", "image", "digest", "notes"}, "slug, image, digest and notes inputs required")
+        for name in ("slug", "image", "digest"):
+            field = declared[name]
+            require(field.get("type") == "string" and field.get("required") is True and "default" not in field,
+                    "required string inputs without defaults")
+        notes = declared["notes"]
+        require(notes.get("type") == "string" and notes.get("default") == "" and not notes.get("required"),
+                "optional notes input required")
+        secrets = call.get("secrets", {})
+        require(set(secrets) == {"TELEGRAM_RELEASES_BOT_TOKEN"}, "optional telegram secret only")
+        require(secrets["TELEGRAM_RELEASES_BOT_TOKEN"].get("required") is False, "telegram secret must be optional")
+        require(jobs["release"].get("permissions") == {"contents": "write"}, "release permission boundary required")
+        require("if" not in jobs["release"] and "needs" not in jobs["release"], "release job must run alone")
+        steps = jobs["release"].get("steps", [])
+        plan = next((s for s in steps if s.get("id") == "plan"), None)
+        require(plan is not None and steps[0] is plan, "validation must run first")
+        require({plan["env"].get(k) for k in ("SLUG", "IMAGE", "DIGEST", "NOTES")}
+                == {"${{ inputs.slug }}", "${{ inputs.image }}", "${{ inputs.digest }}", "${{ inputs.notes }}"},
+                "validation must read inputs through env")
+        checkout = next((s for s in steps if s.get("uses", "").startswith("actions/checkout@")), None)
+        require(checkout is not None and checkout.get("with", {}).get("fetch-depth") == 0,
+                "full history checkout required")
+        for step in steps:
+            if step is plan:
+                continue
+            used = repr(step)
+            require("inputs." not in used, "raw inputs may only enter the validation step through env")
+        telegram = next((s for s in steps if s.get("name") == "Notify Telegram"), None)
+        require(telegram is not None, "telegram notify step required")
+        require(telegram["env"].get("TELEGRAM_RELEASES_BOT_TOKEN") == "${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}",
+                "telegram token must use the optional workflow secret")
+        require("gh release create" in " ".join(s.get("run", "") for s in steps), "gh release create required")
+        require("curl --fail-with-body" in telegram.get("run", ""), "telegram curl boundary required")
+        outputs = call.get("outputs", {})
+        require(set(outputs) == {"tag", "digest", "image", "slug", "release-url"}, "release outputs required")
     else:
         require(set(jobs) == {"cleanup"}, "one cleanup job required")
         require(call.get("inputs", {}).get("dry-run", {}).get("default") is True, "cleanup dry-run default required")
@@ -351,6 +390,7 @@ def main():
         validate_reusable(load_yaml(root / ".github/workflows/image.yml"), "image")
         validate_reusable(load_yaml(root / ".github/workflows/ghcr-cleanup.yml"), "cleanup")
         validate_reusable(load_yaml(root / ".github/workflows/deployed-tag.yml"), "deployed")
+        validate_reusable(load_yaml(root / ".github/workflows/release.yml"), "release")
         if args.snapshot:
             for path in paths:
                 target = args.snapshot / path
