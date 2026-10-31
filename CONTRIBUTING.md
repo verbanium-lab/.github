@@ -33,7 +33,7 @@ documentation. New owned files require an explicit allowlist change reviewed by 
 copy private toolkit content, environment files, credentials or local caches into this repository.
 No private toolkit dependency is needed to run these checks.
 
-The owned inventory also covers `image.yml`, `ghcr-cleanup.yml`, `deployed-tag.yml`, their regression tests and
+The owned inventory also covers `image.yml`, `ghcr-cleanup.yml`, `deployed-tag.yml`, `release.yml`, their regression tests and
 `docs/reusable-workflows.md`. Reusable workflows require empty top-level permissions, pinned
 approved actions, explicit job credential boundaries and validated cleanup defaults. Unresolved
 `TODO(pin)` references intentionally fail validation: the offline draft is not ready for adoption

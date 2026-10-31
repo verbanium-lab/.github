@@ -48,6 +48,7 @@ def github_output(text):
 PLAN = embedded_python('.github/workflows/image.yml', 'Validate inputs and publication boundary')
 MERGE = embedded_python('.github/workflows/image.yml', 'Merge and inspect OCI index')
 DEPLOYED = embedded_python('.github/workflows/deployed-tag.yml', 'Validate inputs and event boundary')
+RELEASE = embedded_python('.github/workflows/release.yml', 'Validate inputs and event boundary')
 RETENTION = embedded_python('.github/workflows/ghcr-cleanup.yml', 'Protect the latest ten sha tags')
 AFFECTED = embedded_python('docs/reusable-workflows.md', 'Select affected images')
 
@@ -211,6 +212,42 @@ class WorkflowBehaviorTests(unittest.TestCase):
         ):
             with self.subTest(changes=changes):
                 result, values = self.deployed(**changes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {})
+
+    def release(self, **changes):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'output'
+            env = dict(SLUG='landing', IMAGE='ghcr.io/verbanium-lab/landing',
+                       DIGEST='sha256:' + 'a' * 64, NOTES='',
+                       EVENT='push', REF='refs/heads/main', SHA='b' * 40,
+                       OWNER='verbanium-lab', SERVER='https://github.com',
+                       REPOSITORY='verbanium-lab/verbanium-apps', GITHUB_OUTPUT=str(output))
+            env.update(changes)
+            result = subprocess.run([sys.executable, '-c', RELEASE], env=env, capture_output=True, text=True)
+            values = github_output(output.read_text()) if output.exists() else {}
+            return result, values
+
+    def test_release_plan_builds_tag_and_telegram_html(self):
+        result, values = self.release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values['slug'], 'landing')
+        self.assertEqual(values['digest'], 'sha256:' + 'a' * 64)
+        self.assertTrue(values['tag'].startswith('landing-'))
+        self.assertTrue(values['tag'].endswith('-' + 'b' * 7))
+        self.assertIn('<b>landing</b>', values['telegram-text'])
+        self.assertIn('ghcr.io/verbanium-lab/landing', values['telegram-text'])
+        self.assertNotIn('<script', values['telegram-text'])
+
+    def test_release_plan_rejects_invalid_boundary(self):
+        for changes in (
+            dict(SLUG='Landing'), dict(SLUG=''), dict(SLUG='x' * 64),
+            dict(IMAGE='ghcr.io/other/landing'), dict(DIGEST='sha256:' + 'A' * 64),
+            dict(EVENT='pull_request'), dict(REF='refs/heads/feature'), dict(OWNER='other'),
+            dict(NOTES='a' * 20000), dict(SHA='short'),
+        ):
+            with self.subTest(changes=changes):
+                result, values = self.release(**changes)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(values, {})
 

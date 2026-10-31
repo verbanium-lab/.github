@@ -1,0 +1,294 @@
+name: Reusable image release
+
+# Creates a GitHub Release and tag `<slug>-<YYYY.MM.DD>-<sha7>` in the caller repository after a
+# main image build. Optional Telegram notification uses organization secrets and variables.
+#
+# Caller example (after the image job on main):
+#   release:
+#     needs: image-main
+#     if: ${{ needs.image-main.outputs.digest != '' }}
+#     permissions:
+#       contents: write
+#     secrets:
+#       TELEGRAM_RELEASES_BOT_TOKEN: ${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}
+#     uses: verbanium-lab/.github/.github/workflows/release.yml@REVIEWED_WORKFLOW_COMMIT
+#     with:
+#       slug: landing
+#       image: ${{ needs.image-main.outputs.image }}
+#       digest: ${{ needs.image-main.outputs.digest }}
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        description: Application slug used in the release name prefix
+        required: true
+        type: string
+      image:
+        description: Full lowercase ghcr.io/verbanium-lab image name, without a tag or digest
+        required: true
+        type: string
+      digest:
+        description: Published OCI index digest, sha256 followed by 64 lowercase hex characters
+        required: true
+        type: string
+      notes:
+        description: Optional extra markdown appended after the generated release body
+        default: ''
+        type: string
+    secrets:
+      TELEGRAM_RELEASES_BOT_TOKEN:
+        description: Telegram bot token for the Deployment and releases topic; omit to skip notify
+        required: false
+    outputs:
+      tag:
+        description: Release and tag name `<slug>-<YYYY.MM.DD>-<sha7>`
+        value: ${{ jobs.release.outputs.tag }}
+      digest:
+        description: Image index digest from inputs
+        value: ${{ jobs.release.outputs.digest }}
+      image:
+        description: Image name from inputs
+        value: ${{ jobs.release.outputs.image }}
+      slug:
+        description: Application slug from inputs
+        value: ${{ jobs.release.outputs.slug }}
+      release-url:
+        description: GitHub Release page URL in the caller repository
+        value: ${{ jobs.release.outputs.release-url }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: reusable-release-${{ inputs.slug }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      digest: ${{ steps.plan.outputs.digest }}
+      image: ${{ steps.plan.outputs.image }}
+      slug: ${{ steps.plan.outputs.slug }}
+      release-url: ${{ steps.plan.outputs.release-url }}
+    steps:
+      - name: Validate inputs and event boundary
+        id: plan
+        env:
+          SLUG: ${{ inputs.slug }}
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+          NOTES: ${{ inputs.notes }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          OWNER: ${{ github.repository_owner }}
+          SERVER: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import html
+          import os
+          import re
+          from datetime import datetime, timezone
+
+          def require(ok, message):
+              if not ok:
+                  raise SystemExit(message)
+
+          env = os.environ
+          require(env['OWNER'] == 'verbanium-lab', 'Organization repository required')
+          require(env['EVENT'] == 'push' and env['REF'] == 'refs/heads/main', 'Main push required')
+          require(re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}', env['SLUG']), 'Invalid slug')
+          require(re.fullmatch(r'ghcr\.io/verbanium-lab/[a-z0-9]+(?:[._/-][a-z0-9]+)*', env['IMAGE']),
+                  'Invalid image name')
+          require(re.fullmatch(r'sha256:[0-9a-f]{64}', env['DIGEST']), 'Invalid digest')
+          require(re.fullmatch(r'[0-9a-f]{40}', env['SHA']), 'Invalid source SHA')
+          notes = env['NOTES']
+          require(len(notes) <= 16384, 'Notes too long')
+          require('\x00' not in notes, 'Invalid notes')
+          build_date = datetime.now(timezone.utc).strftime('%Y.%m.%d')
+          sha7 = env['SHA'][:7]
+          tag = f"{env['SLUG']}-{build_date}-{sha7}"
+          require(re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}-\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7}', tag),
+                  'Invalid release tag')
+          image_ref = env['IMAGE'] + '@' + env['DIGEST']
+          release_url = env['SERVER'] + '/' + env['REPOSITORY'] + '/releases/tag/' + tag
+          digest_short = env['DIGEST'][7:19]
+          telegram_text = (
+              f"<b>{html.escape(env['SLUG'])}</b> {html.escape(env['IMAGE'])}\n"
+              f"<code>{html.escape(digest_short)}</code>\n"
+              f'<a href="{html.escape(release_url, quote=True)}">Release</a>'
+          )
+          with open(env['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in {
+                  'tag': tag,
+                  'digest': env['DIGEST'],
+                  'image': env['IMAGE'],
+                  'slug': env['SLUG'],
+                  'build-date': build_date,
+                  'sha7': sha7,
+                  'image-ref': image_ref,
+                  'release-url': release_url,
+              }.items():
+                  print(f'{key}={value}', file=output)
+              print('telegram-text<<TELEGRAM_EOF', telegram_text, 'TELEGRAM_EOF', sep='\n', file=output)
+              if notes:
+                  print('notes<<NOTES_EOF', notes, 'NOTES_EOF', sep='\n', file=output)
+              else:
+                  print('notes=', file=output)
+          PY
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Compose release notes
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          SLUG: ${{ steps.plan.outputs.slug }}
+          IMAGE_REF: ${{ steps.plan.outputs.image-ref }}
+          DIGEST: ${{ steps.plan.outputs.digest }}
+          SHA: ${{ github.sha }}
+          BUILD_DATE: ${{ steps.plan.outputs.build-date }}
+          EXTRA: ${{ steps.plan.outputs.notes }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          env = os.environ
+          slug = env['SLUG']
+          tag = env['TAG']
+          image_line = 'Deploy by digest: `' + env['IMAGE_REF'] + '`'
+          prev = ''
+          for line in subprocess.check_output(['git', 'tag', '-l', slug + '-*', '--sort=-creatordate'],
+                                              text=True).splitlines():
+              name = line.strip()
+              if name and name != tag and re.fullmatch(re.escape(slug) + r'-\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7}', name):
+                  prev = name
+                  break
+          rollback = '_None (first release for this slug)._'
+          if prev:
+              try:
+                  prev_body = subprocess.check_output(
+                      ['gh', 'release', 'view', prev, '--json', 'body', '-q', '.body'],
+                      text=True,
+                      stderr=subprocess.DEVNULL,
+                  )
+              except subprocess.CalledProcessError:
+                  prev_body = ''
+              match = re.search(r'Deploy by digest: `([^`]+)`', prev_body)
+              if match:
+                  rollback = f'Previous release `{prev}` — deploy `{match.group(1)}`'
+              else:
+                  rollback = f'Previous release `{prev}` — digest not recorded; use the prior release page.'
+          log_range = prev + '..HEAD' if prev else 'HEAD'
+          log_lines = subprocess.check_output(['git', 'log', '--oneline', log_range], text=True).splitlines()
+          capped = log_lines[:50]
+          if len(log_lines) > 50:
+              capped.append(f'_… and {len(log_lines) - 50} more commits._')
+          changes = '\n'.join('- ' + line for line in capped) if capped else '_No commits in range._'
+          body = '\n'.join([
+              '## Image',
+              image_line,
+              '',
+              '## Commit',
+              '`' + env['SHA'] + '`',
+              '',
+              '## Build date (UTC)',
+              '`' + env['BUILD_DATE'] + '`',
+              '',
+              '## Changes since previous release',
+              changes,
+              '',
+              '## Rollback',
+              rollback,
+          ])
+          extra = env['EXTRA']
+          if extra.strip():
+              body += '\n\n## Additional notes\n' + extra.strip()
+          notes_path = os.path.join(env['RUNNER_TEMP'], 'release-notes.md')
+          with open(notes_path, 'w', encoding='utf-8') as handle:
+              handle.write(body)
+          with open(env['GITHUB_OUTPUT'], 'a') as output:
+              print('notes-path=' + notes_path, file=output)
+              print('prev-tag=' + prev, file=output)
+          PY
+      - name: Create GitHub Release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          SHA: ${{ github.sha }}
+          DIGEST: ${{ steps.plan.outputs.digest }}
+          RELEASE_URL: ${{ steps.plan.outputs.release-url }}
+          NOTES_PATH: ${{ steps.notes.outputs.notes-path }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[a-z0-9][a-z0-9_-]{0,62}-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{7}$ ]]
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes-file "$NOTES_PATH"
+          {
+            echo "### Release"
+            echo
+            echo "- Tag: \`$TAG\`"
+            echo "- Digest: \`$DIGEST\`"
+            echo "- URL: $RELEASE_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Notify Telegram
+        env:
+          TELEGRAM_RELEASES_BOT_TOKEN: ${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}
+          CHAT_ID: ${{ vars.TELEGRAM_RELEASES_CHAT_ID }}
+          THREAD_ID: ${{ vars.TELEGRAM_RELEASES_THREAD_ID }}
+          TEXT: ${{ steps.plan.outputs.telegram-text }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TELEGRAM_RELEASES_BOT_TOKEN:-}" ]]; then
+            echo "Telegram skipped: TELEGRAM_RELEASES_BOT_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ -z "${CHAT_ID:-}" || -z "${THREAD_ID:-}" ]]; then
+            echo "Telegram skipped: TELEGRAM_RELEASES_CHAT_ID or TELEGRAM_RELEASES_THREAD_ID is not set." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ ! "$CHAT_ID" =~ ^-?[0-9]+$ ]]; then
+            echo "::error::Invalid TELEGRAM_RELEASES_CHAT_ID"
+            exit 1
+          fi
+          if [[ ! "$THREAD_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid TELEGRAM_RELEASES_THREAD_ID"
+            exit 1
+          fi
+          payload="$(python3 - <<'PY'
+          import json
+          import os
+          print(json.dumps({
+              "chat_id": os.environ["CHAT_ID"],
+              "message_thread_id": int(os.environ["THREAD_ID"]),
+              "parse_mode": "HTML",
+              "disable_web_page_preview": False,
+              "text": os.environ["TEXT"],
+          }))
+          PY
+          )"
+          # A failed notification never fails the release: the release already exists.
+          if curl --fail-with-body -sS -o /dev/null -X POST \
+            -H 'Content-Type: application/json' \
+            -d "$payload" \
+            "https://api.telegram.org/bot${TELEGRAM_RELEASES_BOT_TOKEN}/sendMessage"; then
+            echo "Telegram notification sent." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::Telegram notification failed; the release was created."
+          fi
