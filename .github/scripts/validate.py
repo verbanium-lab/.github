@@ -12,7 +12,7 @@ import yaml
 
 MAX_BYTES = 256 * 1024
 OWNED_FILES = {
-    "README.md", "CONTRIBUTING.md", ".gitignore",
+    "README.md", "CONTRIBUTING.md", ".gitignore", "LICENSE", "SECURITY.md", "profile/README.md",
     ".github/CODEOWNERS", ".github/pull_request_template.md",
     ".github/ISSUE_TEMPLATE/task.yml", ".github/ISSUE_TEMPLATE/config.yml",
     ".github/workflows/ci.yml", ".github/scripts/validate.py",
