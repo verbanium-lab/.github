@@ -153,7 +153,7 @@ class DefaultsTests(unittest.TestCase):
 
     def reusable(self, kind):
         name = {'image': 'image', 'cleanup': 'ghcr-cleanup', 'deployed': 'deployed-tag',
-                'release': 'release', 'status': 'status'}[kind]
+                'release': 'release', 'notify': 'release-notify', 'status': 'status'}[kind]
         workflow = validator.load_yaml(ROOT / f'.github/workflows/{name}.yml')
         # Synthetic pinned references isolate boundary rejection tests from the offline pin gate.
         for job in workflow['jobs'].values():
@@ -164,7 +164,7 @@ class DefaultsTests(unittest.TestCase):
         return workflow
 
     def test_reusable_rejects_unpinned_actions_and_interpolation(self):
-        for kind in ('image', 'cleanup', 'deployed', 'release', 'status'):
+        for kind in ('image', 'cleanup', 'deployed', 'release', 'notify', 'status'):
             workflow = self.reusable(kind)
             for job in workflow['jobs'].values():
                 for step in job.get('steps', []):
@@ -353,3 +353,22 @@ class DefaultsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NotifyBoundaryTests(unittest.TestCase):
+    def test_notify_rejects_wider_boundaries(self):
+        base = validator.load_yaml(ROOT / '.github/workflows/release-notify.yml')
+        validator.validate_reusable(copy.deepcopy(base), 'notify')
+        for mutate in (
+            lambda w: w['jobs']['notify'].update(permissions={'contents': 'write'}),
+            lambda w: w[True]['workflow_call']['inputs'].update(extra={'type': 'string'}),
+            lambda w: w[True]['workflow_call']['secrets']['TELEGRAM_RELEASES_BOT_TOKEN'].update(required=True),
+            lambda w: w['jobs']['notify']['steps'][1].update(uses='actions/checkout@' + 'a' * 40),
+            lambda w: w['jobs']['notify']['steps'][1].update(run='gh release create x'),
+        ):
+            bad = copy.deepcopy(base)
+            mutate(bad)
+            with self.subTest(workflow=bad):
+                with self.assertRaises(validator.Invalid):
+                    validator.validate_reusable(bad, 'notify')
+

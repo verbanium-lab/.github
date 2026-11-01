@@ -20,6 +20,7 @@ OWNED_FILES = {
     ".github/scripts/requirements.txt", ".github/tests/test_validate.py",
     ".github/workflows/image.yml", ".github/workflows/ghcr-cleanup.yml",
     ".github/workflows/deployed-tag.yml", ".github/workflows/release.yml",
+    ".github/workflows/release-notify.yml",
     ".github/workflows/status.yml",
     ".github/scripts/collect_status.py", ".github/scripts/render_status.py",
     ".github/tests/test_status.py",
@@ -226,6 +227,7 @@ def validate_reusable(workflow, kind):
         "cleanup": {"dataaxiom/ghcr-cleanup-action"},
         "deployed": {"docker/setup-buildx-action"},
         "release": {"actions/checkout"},
+        "notify": set(),
         "status": {"actions/checkout", "actions/download-artifact"},
     }[kind]
     for job in jobs.values():
@@ -369,6 +371,29 @@ def validate_reusable(workflow, kind):
         require("curl --fail-with-body" in telegram.get("run", ""), "telegram curl boundary required")
         outputs = call.get("outputs", {})
         require(set(outputs) == {"tag", "digest", "image", "slug", "release-url"}, "release outputs required")
+    elif kind == "notify":
+        require(set(jobs) == {"notify"}, "one notify job required")
+        declared = call.get("inputs", {})
+        require(set(declared) == {"tags"}, "tags input only")
+        tags = declared["tags"]
+        require(tags.get("type") == "string" and tags.get("required") is True and "default" not in tags,
+                "required tags input without default")
+        secrets = call.get("secrets", {})
+        require(set(secrets) == {"TELEGRAM_RELEASES_BOT_TOKEN"}, "optional telegram secret only")
+        require(secrets["TELEGRAM_RELEASES_BOT_TOKEN"].get("required") is False, "telegram secret must be optional")
+        job = jobs["notify"]
+        require(job.get("permissions") == {"contents": "read"}, "notify permission boundary required")
+        require("if" not in job and "needs" not in job, "notify job must run alone")
+        steps = job.get("steps", [])
+        require(steps and steps[0].get("id") == "plan" and steps[0]["env"].get("TAGS") == "${{ inputs.tags }}",
+                "validation must run first and read tags through env")
+        for step in steps[1:]:
+            require("inputs." not in repr(step), "raw inputs may only enter the validation step through env")
+            require("uses" not in step, "notify uses no actions")
+        telegram = next((s for s in steps if s.get("name") == "Notify Telegram"), None)
+        require(telegram is not None and telegram["env"].get("TELEGRAM_RELEASES_BOT_TOKEN")
+                == "${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}", "telegram token must use the optional workflow secret")
+        require("gh release create" not in " ".join(s.get("run", "") for s in steps), "notify never creates releases")
     elif kind == "status":
         require(set(jobs) == {"status"}, "one status job required")
         require(not call.get("secrets"), "status workflow must not accept secrets")
@@ -431,6 +456,7 @@ def main():
         validate_reusable(load_yaml(root / ".github/workflows/ghcr-cleanup.yml"), "cleanup")
         validate_reusable(load_yaml(root / ".github/workflows/deployed-tag.yml"), "deployed")
         validate_reusable(load_yaml(root / ".github/workflows/release.yml"), "release")
+        validate_reusable(load_yaml(root / ".github/workflows/release-notify.yml"), "notify")
         validate_reusable(load_yaml(root / ".github/workflows/status.yml"), "status")
         if args.snapshot:
             for path in paths:

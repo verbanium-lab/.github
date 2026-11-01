@@ -49,6 +49,7 @@ PLAN = embedded_python('.github/workflows/image.yml', 'Validate inputs and publi
 MERGE = embedded_python('.github/workflows/image.yml', 'Merge and inspect OCI index')
 DEPLOYED = embedded_python('.github/workflows/deployed-tag.yml', 'Validate inputs and event boundary')
 RELEASE = embedded_python('.github/workflows/release.yml', 'Validate inputs and event boundary')
+NOTIFY = embedded_python('.github/workflows/release-notify.yml', 'Validate tags and event boundary')
 RETENTION = embedded_python('.github/workflows/ghcr-cleanup.yml', 'Protect the latest ten sha tags')
 AFFECTED = embedded_python('docs/reusable-workflows.md', 'Select affected images')
 
@@ -250,6 +251,38 @@ class WorkflowBehaviorTests(unittest.TestCase):
         ):
             with self.subTest(changes=changes):
                 result, values = self.release(**changes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {})
+
+    def notify(self, **changes):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'output'
+            env = dict(TAGS='studio-v0.2.0', EVENT='push', REF='refs/heads/main', OWNER='verbanium-lab',
+                       SERVER='https://github.com', REPOSITORY='verbanium-lab/verbanium-templates',
+                       GITHUB_OUTPUT=str(output))
+            env.update(changes)
+            result = subprocess.run([sys.executable, '-c', NOTIFY], env=env, capture_output=True, text=True)
+            values = github_output(output.read_text()) if output.exists() else {}
+            return result, values
+
+    def test_notify_plan_builds_one_message_per_tag(self):
+        result, values = self.notify(TAGS='studio-v0.2.0 tokens-v1.0.0-rc.1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        messages = json.loads(values['messages'])
+        self.assertEqual(values['count'], '2')
+        self.assertIn('<b>studio</b> v0.2.0', messages[0])
+        self.assertIn('releases/tag/studio-v0.2.0', messages[0])
+        self.assertIn('<b>tokens</b> v1.0.0-rc.1', messages[1])
+
+    def test_notify_plan_rejects_invalid_boundary(self):
+        for changes in (
+            dict(TAGS=''), dict(TAGS='studio-2026.11.01-abcdef0'), dict(TAGS='Studio-v1.0.0'),
+            dict(TAGS='studio-v1.0.0 studio-v1.0.0'), dict(TAGS='<b>-v1.0.0'),
+            dict(EVENT='pull_request'), dict(REF='refs/heads/feature'), dict(OWNER='other'),
+            dict(TAGS=' '.join(f'a{i}-v1.0.0' for i in range(21))),
+        ):
+            with self.subTest(changes=changes):
+                result, values = self.notify(**changes)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(values, {})
 
