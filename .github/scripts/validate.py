@@ -25,6 +25,7 @@ OWNED_FILES = {
     ".github/scripts/collect_status.py", ".github/scripts/render_status.py",
     ".github/tests/test_status.py",
     ".github/tests/test_workflows.py", "docs/reusable-workflows.md",
+    "lefthook.yml", ".github/scripts/hooks/pre-push.sh", ".github/scripts/hooks/staged.sh",
 }
 FIELDS = {
     "goal": ("textarea", "Goal", None),
