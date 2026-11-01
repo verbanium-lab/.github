@@ -29,6 +29,7 @@ local check and the owner-controlled activation steps.
 | [image.yml](.github/workflows/image.yml) | Native amd64/arm64 builds, main and same-repository preview publication, provenance and SBOM |
 | [ghcr-cleanup.yml](.github/workflows/ghcr-cleanup.yml) | Per-package retention with protected release/deployed tags; dry-run by default |
 | [deployed-tag.yml](.github/workflows/deployed-tag.yml) | Moves `deployed-<env>` to the digest that runs in an environment, without pulling layers |
+| [status.yml](.github/workflows/status.yml) | Refreshes the README status table from releases, GHCR deployed tags and optional coverage |
 | [release.yml](.github/workflows/release.yml) | GitHub Release per main image build (`<slug>-<YYYY.MM.DD>-<sha7>`) and optional Telegram notify |
 
 See [caller recipes and adoption requirements](docs/reusable-workflows.md) for fixed-app wiki and
@@ -74,11 +75,13 @@ jobs:
     permissions:
       contents: read
       packages: write
+      deployments: write
     uses: verbanium-lab/.github/.github/workflows/deployed-tag.yml@REVIEWED_WORKFLOW_COMMIT
     with:
       image: ${{ inputs.image }}
       digest: ${{ inputs.digest }}
       env: ${{ inputs.env }}
+      release: ''
 ```
 
 Run it from the default branch with the image, the deployed `sha256:` digest and the environment.

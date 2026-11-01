@@ -1,0 +1,194 @@
+name: Reusable README status
+
+# Refreshes the status table between <!-- status:start --> and <!-- status:end --> in README.md.
+# Caller triggers: release published, workflow_run after deployed-tag, or workflow_dispatch.
+#
+#   name: README status
+#   on:
+#     release:
+#       types: [published]
+#     workflow_run:
+#       workflows: [Deployed tag]
+#       types: [completed]
+#     workflow_dispatch:
+#   permissions: {}
+#   jobs:
+#     status:
+#       if: >-
+#         github.event_name != 'workflow_run' ||
+#         github.event.workflow_run.conclusion == 'success'
+#       permissions:
+#         contents: write
+#         packages: read
+#         deployments: read
+#       uses: verbanium-lab/.github/.github/workflows/status.yml@REVIEWED_WORKFLOW_COMMIT
+#       with:
+#         apps: >-
+#           [{"slug":"iblonda-web","image":"ghcr.io/verbanium-lab/iblonda-web"},
+#            {"slug":"iblonda-admin","image":"ghcr.io/verbanium-lab/iblonda-admin"}]
+
+on:
+  workflow_call:
+    inputs:
+      apps:
+        description: JSON array of objects with slug and image (ghcr.io/verbanium-lab/…)
+        required: true
+        type: string
+      coverage-artifact:
+        description: Optional workflow artifact name with coverage.json for report links
+        default: ''
+        type: string
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: readme-status-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  status:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      packages: read
+      deployments: read
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check out status scripts
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: verbanium-lab/.github
+          ref: ${{ github.action_ref }}
+          path: _github-defaults
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            .github/scripts/collect_status.py
+            .github/scripts/render_status.py
+      - name: Collect release and registry data
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APPS_JSON: ${{ inputs.apps }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER: ${{ github.server_url }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 _github-defaults/.github/scripts/collect_status.py > "$RUNNER_TEMP/status-data.json"
+          echo "data-path=$RUNNER_TEMP/status-data.json" >> "$GITHUB_OUTPUT"
+      - name: Download coverage artifact
+        if: ${{ inputs.coverage-artifact != '' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.coverage-artifact }}
+          path: ${{ runner.temp }}/coverage
+      - name: Merge coverage into status data
+        if: ${{ inputs.coverage-artifact != '' }}
+        env:
+          DATA_PATH: ${{ steps.collect.outputs.data-path }}
+          COVERAGE_DIR: ${{ runner.temp }}/coverage
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          data_path = os.environ['DATA_PATH']
+          payload = json.loads(Path(data_path).read_text(encoding='utf-8'))
+          coverage_path = Path(os.environ['COVERAGE_DIR']) / 'coverage.json'
+          if coverage_path.is_file():
+              coverage = json.loads(coverage_path.read_text(encoding='utf-8'))
+              for row in payload['rows']:
+                  slug = row.get('slug')
+                  if slug in coverage:
+                      row['coverage'] = coverage[slug]
+          Path(data_path).write_text(json.dumps(payload), encoding='utf-8')
+          PY
+      - name: Render README status block
+        id: render
+        env:
+          DATA_PATH: ${{ steps.collect.outputs.data-path }}
+        run: |
+          set -euo pipefail
+          result="$(python3 _github-defaults/.github/scripts/render_status.py --readme README.md --data "$DATA_PATH")"
+          echo "$result"
+          if [[ "$result" == changed=true ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      # One fixed, recognisable commit (owner, 2026-10-31): github-actions[bot], the exact message
+      # "chore(status): update README status [skip ci]" with the trailer "Status-Update: automated",
+      # created through the GraphQL createCommitOnBranch mutation so GitHub signs it (Verified).
+      # GITHUB_TOKEN commits start no workflows; [skip ci] and the caller's paths-ignore back that up.
+      # If repository rules refuse the commit on the default branch, the same commit goes to a
+      # bot/readme-status-<run> branch and a pull request with the same title is opened.
+      - name: Commit status update
+        if: ${{ steps.render.outputs.changed == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+
+          repo = os.environ['REPOSITORY']
+          default = os.environ['DEFAULT_BRANCH']
+          headline = 'chore(status): update README status [skip ci]'
+          body = 'Status-Update: automated'
+          contents = base64.b64encode(open('README.md', 'rb').read()).decode()
+
+          def head(branch):
+              return subprocess.check_output(
+                  ['gh', 'api', f'repos/{repo}/git/ref/heads/{branch}', '-q', '.object.sha'],
+                  text=True).strip()
+
+          def commit(branch):
+              query = (
+                  'mutation($input: CreateCommitOnBranchInput!) {'
+                  ' createCommitOnBranch(input: $input) { commit { oid url } } }'
+              )
+              variables = {'input': {
+                  'branch': {'repositoryNameWithOwner': repo, 'branchName': branch},
+                  'expectedHeadOid': head(branch),
+                  'message': {'headline': headline, 'body': body},
+                  'fileChanges': {'additions': [{'path': 'README.md', 'contents': contents}]},
+              }}
+              payload = json.dumps({'query': query, 'variables': variables})
+              result = subprocess.run(['gh', 'api', 'graphql', '--input', '-'], input=payload,
+                                      text=True, capture_output=True)
+              ok = result.returncode == 0 and '"errors"' not in result.stdout
+              return ok, (result.stdout + result.stderr)[-500:]
+
+          ok, detail = commit(default)
+          if ok:
+              print(f'Committed the status update to {default} (signed by GitHub).')
+          else:
+              print(f'::notice::Direct commit refused ({detail.strip()}); opening a pull request.')
+              branch = f"bot/readme-status-{os.environ['GITHUB_RUN_ID']}"
+              base_sha = head(default)
+              subprocess.check_call(['gh', 'api', '-X', 'POST', f'repos/{repo}/git/refs',
+                                     '-f', f'ref=refs/heads/{branch}', '-f', f'sha={base_sha}'],
+                                    stdout=subprocess.DEVNULL)
+              ok, detail = commit(branch)
+              if not ok:
+                  raise SystemExit(f'Status commit failed on {branch}: {detail}')
+              subprocess.check_call(['gh', 'pr', 'create', '--repo', repo, '--base', default,
+                                     '--head', branch, '--title', headline,
+                                     '--body', 'Status-Update: automated'])
+          PY

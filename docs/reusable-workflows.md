@@ -471,17 +471,23 @@ on:
         required: true
         type: choice
         options: [dev, rc, prod]
+      release:
+        description: Optional release tag when the digest matches a GitHub Release
+        required: false
+        type: string
 permissions: {}
 jobs:
   deployed-tag:
     permissions:
       contents: read
       packages: write
+      deployments: write
     uses: verbanium-lab/.github/.github/workflows/deployed-tag.yml@REVIEWED_WORKFLOW_COMMIT
     with:
       image: ${{ inputs.image }}
       digest: ${{ inputs.digest }}
       env: ${{ inputs.env }}
+      release: ${{ inputs.release }}
 ```
 
 The `image` is a full `ghcr.io/verbanium-lab/...` name without a tag or digest; `digest` is the OCI
@@ -500,13 +506,70 @@ What the workflow does:
   provenance and SBOM, is kept.
 - Runs `docker buildx imagetools inspect <image>:deployed-<env>` and fails unless the top digest equals
   the input digest. The job summary shows the tag, the expected digest and the tag's digest.
-- Uses only the job's `GITHUB_TOKEN` with `contents: read` and `packages: write`; no checkout and no
-  secret. The package must grant the calling repository write access, as for `image.yml`.
+- Creates a GitHub Deployment in the caller repository (`production`, `rc` or `dev`) with `ref` set to
+  the release target commit when `release` is supplied and resolves, otherwise the default branch.
+  Payload fields: `image`, `digest`, `release`. A success deployment status is recorded with no
+  `environment_url`.
+- Uses only the job's `GITHUB_TOKEN` with `contents: read`, `packages: write` and `deployments: write`;
+  no checkout and no secret. The package must grant the calling repository write access, as for `image.yml`.
 - Serializes moves per image and environment; a newer waiting request replaces an older waiting one.
 
 Not verified offline: that `imagetools create` from a single index source returns an identical
 index digest. The check after the move fails the job if it does not. Confirm it in the first real
 caller run, then record the evidence in the retention rollout.
+
+## README status block
+
+Caller repositories that publish releases and move `deployed-*` tags can refresh a Markdown table in
+`README.md` between `<!-- status:start -->` and `<!-- status:end -->`. The reusable
+`.github/workflows/status.yml` workflow:
+
+- Reads the latest GitHub Release per app slug (name prefix `<slug>-`), resolves `deployed-prod` and
+  `deployed-rc` digests from GHCR, and links each digest to the release whose body contains the
+  matching ``Deploy by digest: `<image>@sha256:…` `` line (otherwise shows a short digest).
+- Optionally merges a downloaded artifact's `coverage.json` (`slug` → `{unit, e2e}` URL objects) into
+  the Coverage column.
+- Inserts the native CI badge line when it is absent inside the block. When the block changed, it
+  commits `README.md` through the GraphQL `createCommitOnBranch` mutation — signed by GitHub
+  (Verified), author `github-actions[bot]`, always the same message
+  `chore(status): update README status [skip ci]` with the trailer `Status-Update: automated`. If
+  repository rules refuse it, the same commit goes to `bot/readme-status-<run>` with a pull request
+  of the same title. The commit starts no workflow (`GITHUB_TOKEN`, `[skip ci]`); callers also add
+  `paths-ignore: [README.md]` to the push trigger of their CI.
+
+Grant `contents: write`, `packages: read` and `deployments: read` on the calling job. Add markers to
+`README.md` before the first run.
+
+Example for `iblonda-apps`:
+
+```yaml
+name: README status
+on:
+  release:
+    types: [published]
+  workflow_run:
+    workflows: [Deployed tag]
+    types: [completed]
+  workflow_dispatch:
+permissions: {}
+jobs:
+  status:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: write
+      packages: read
+      deployments: read
+    uses: verbanium-lab/.github/.github/workflows/status.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      apps: >-
+        [{"slug":"iblonda-web","image":"ghcr.io/verbanium-lab/iblonda-web"},
+         {"slug":"iblonda-admin","image":"ghcr.io/verbanium-lab/iblonda-admin"}]
+```
+
+When repository rulesets block bot pushes to the default branch, merge the automation PR or add a
+ruleset bypass for `github-actions[bot]` on the status commit message.
 
 ## Verification and recovery
 

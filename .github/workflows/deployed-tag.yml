@@ -33,11 +33,13 @@ name: Reusable deployed tag
 #       permissions:
 #         contents: read
 #         packages: write
+#         deployments: write
 #       uses: verbanium-lab/.github/.github/workflows/deployed-tag.yml@REVIEWED_WORKFLOW_COMMIT
 #       with:
 #         image: ${{ inputs.image }}
 #         digest: ${{ inputs.digest }}
 #         env: ${{ inputs.env }}
+#         release: ${{ inputs.release }}
 
 on:
   workflow_call:
@@ -53,6 +55,10 @@ on:
       env:
         description: Environment that runs the digest; dev, rc or prod
         required: true
+        type: string
+      release:
+        description: Optional release tag for deployment metadata and ref resolution
+        default: ''
         type: string
 
 permissions: {}
@@ -74,6 +80,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      deployments: write
     steps:
       - name: Validate inputs and event boundary
         id: plan
@@ -81,6 +88,7 @@ jobs:
           IMAGE: ${{ inputs.image }}
           DIGEST: ${{ inputs.digest }}
           TARGET_ENV: ${{ inputs.env }}
+          RELEASE: ${{ inputs.release }}
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
           DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}
@@ -103,9 +111,19 @@ jobs:
                   'Invalid image name')
           require(re.fullmatch(r'sha256:[0-9a-f]{64}', env['DIGEST']), 'Invalid digest')
           require(env['TARGET_ENV'] in ('dev', 'rc', 'prod'), 'Invalid environment')
+          release = env['RELEASE'].strip()
+          if release:
+              require(re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}-\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7}', release),
+                      'Invalid release tag')
+          deployment_env = {'prod': 'production', 'rc': 'rc', 'dev': 'dev'}[env['TARGET_ENV']]
           with open(env['GITHUB_OUTPUT'], 'a') as output:
-              for key, value in {'image': env['IMAGE'], 'digest': env['DIGEST'],
-                                 'tag': 'deployed-' + env['TARGET_ENV']}.items():
+              for key, value in {
+                  'image': env['IMAGE'],
+                  'digest': env['DIGEST'],
+                  'tag': 'deployed-' + env['TARGET_ENV'],
+                  'release': release,
+                  'deployment-environment': deployment_env,
+              }.items():
                   print(f'{key}={value}', file=output)
           PY
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -139,6 +157,63 @@ jobs:
             exit 1
           fi
           echo "- Result: match" >> "$GITHUB_STEP_SUMMARY"
+      - name: Record GitHub Deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          DEPLOYMENT_ENV: ${{ steps.plan.outputs.deployment-environment }}
+          IMAGE: ${{ steps.plan.outputs.image }}
+          DIGEST: ${{ steps.plan.outputs.digest }}
+          RELEASE: ${{ steps.plan.outputs.release }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          env = os.environ
+          for key in ('IMAGE', 'DIGEST', 'DEPLOYMENT_ENV', 'REPOSITORY', 'DEFAULT_BRANCH'):
+              if not env.get(key):
+                  raise SystemExit('Missing deployment context')
+          if not re.fullmatch(r'ghcr\.io/verbanium-lab/[a-z0-9]+(?:[._/-][a-z0-9]+)*', env['IMAGE']):
+              raise SystemExit('Invalid image')
+          if not re.fullmatch(r'sha256:[0-9a-f]{64}', env['DIGEST']):
+              raise SystemExit('Invalid digest')
+          if env['DEPLOYMENT_ENV'] not in ('production', 'rc', 'dev'):
+              raise SystemExit('Invalid deployment environment')
+          release = env.get('RELEASE', '').strip()
+          if release and not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,62}-\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7}', release):
+              raise SystemExit('Invalid release tag')
+          ref = 'refs/heads/' + env['DEFAULT_BRANCH']
+          if release:
+              try:
+                  target = subprocess.check_output(
+                      ['gh', 'release', 'view', release, '--repo', env['REPOSITORY'],
+                       '--json', 'targetCommitish', '-q', '.targetCommitish'],
+                      text=True,
+                  ).strip()
+              except subprocess.CalledProcessError:
+                  target = ''
+              if re.fullmatch(r'[0-9a-f]{40}', target):
+                  ref = target
+          payload = json.dumps({'image': env['IMAGE'], 'digest': env['DIGEST'], 'release': release})
+          deployment = subprocess.check_output(
+              ['gh', 'api', '-X', 'POST', f"repos/{env['REPOSITORY']}/deployments",
+               '-f', f"ref={ref}", '-f', f"environment={env['DEPLOYMENT_ENV']}",
+               '-f', f"payload={payload}", '-f', 'auto_merge=false', '-f', 'required_contexts[]='],
+              text=True,
+          )
+          deployment_id = json.loads(deployment)['id']
+          subprocess.check_output(
+              ['gh', 'api', '-X', 'POST',
+               f"repos/{env['REPOSITORY']}/deployments/{deployment_id}/statuses",
+               '-f', 'state=success'],
+              text=True,
+          )
+          print(f"Recorded deployment {deployment_id} for {env['DEPLOYMENT_ENV']}.")
+          PY
       - name: Log out of GHCR
         if: ${{ always() }}
         run: docker logout ghcr.io
