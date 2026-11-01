@@ -154,7 +154,7 @@ class DefaultsTests(unittest.TestCase):
     def reusable(self, kind):
         name = {'image': 'image', 'cleanup': 'ghcr-cleanup', 'deployed': 'deployed-tag',
                 'release': 'release', 'notify': 'release-notify', 'status': 'status',
-                'deploy': 'deploy-coolify'}[kind]
+                'deploy': 'deploy-coolify', 'merge': 'release-pr-merge'}[kind]
         workflow = validator.load_yaml(ROOT / f'.github/workflows/{name}.yml')
         # Synthetic pinned references isolate boundary rejection tests from the offline pin gate.
         for job in workflow['jobs'].values():
@@ -316,6 +316,28 @@ class DefaultsTests(unittest.TestCase):
             mutate(workflow)
             with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
                 validator.validate_reusable(workflow, 'status')
+
+    def test_release_pr_merge_boundary_rejections(self):
+        self.assertIsNone(validator.validate_reusable(self.reusable('merge'), 'merge'))
+        def strip(needle):
+            def mutate(w):
+                step = w['jobs']['merge']['steps'][-1]
+                step['run'] = step['run'].replace(needle, '')
+            return mutate
+        for mutate in (
+            lambda w: w.update(on={'pull_request_target': None}),
+            lambda w: w['jobs']['merge'].update(permissions={'contents': 'write'}),
+            lambda w: w['jobs']['merge'].pop('environment'),
+            lambda w: w[True]['workflow_call']['secrets'].update(EXTRA={'required': False}),
+            lambda w: w['jobs']['merge']['steps'][1]['with'].update({'permission-administration': 'write'}),
+            lambda w: w['jobs']['merge']['steps'][0].update(env={'CLIENT_ID': 'x'}),
+            strip('"--match-head-commit"'), strip('"--auto"'), strip('verbanium-ci[bot]'),
+            strip('release-please--branches--main'), strip('VERSION_LINE'),
+        ):
+            workflow = self.reusable('merge')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'merge')
 
     def test_secret_fixture_is_rejected_and_redacted(self):
         # Construct a recognizable, deliberately fake token only in a temporary file.

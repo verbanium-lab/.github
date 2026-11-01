@@ -21,7 +21,7 @@ OWNED_FILES = {
     ".github/workflows/image.yml", ".github/workflows/ghcr-cleanup.yml",
     ".github/workflows/deployed-tag.yml", ".github/workflows/release.yml",
     ".github/workflows/release-notify.yml", ".github/workflows/deploy-coolify.yml",
-    ".github/workflows/status.yml",
+    ".github/workflows/status.yml", ".github/workflows/release-pr-merge.yml",
     ".github/scripts/collect_status.py", ".github/scripts/render_status.py",
     ".github/tests/test_status.py",
     ".github/tests/test_workflows.py", "docs/reusable-workflows.md",
@@ -231,6 +231,7 @@ def validate_reusable(workflow, kind):
         "notify": set(),
         "deploy": {"actions/create-github-app-token", "tailscale/github-action"},
         "status": {"actions/checkout", "actions/download-artifact"},
+        "merge": {"actions/create-github-app-token"},
     }[kind]
     for job in jobs.values():
         require(isinstance(job, dict) and "uses" not in job, "local reusable jobs required")
@@ -455,6 +456,34 @@ def validate_reusable(workflow, kind):
                 "Coolify API deploy required")
         require(any(s.get("uses", "").startswith("tailscale/github-action@") and s.get("with", {}).get("tags") == "tag:ci"
                     for s in jobs["deploy"]["steps"]), "ephemeral tag:ci tailnet node required")
+    elif kind == "merge":
+        require(set(jobs) == {"merge"}, "one merge job required")
+        secrets = call.get("secrets", {})
+        require(set(secrets) == {"VERBANIUM_CI_PRIVATE_KEY"} and secrets["VERBANIUM_CI_PRIVATE_KEY"].get("required") is True,
+                "the verbanium-ci key is the only secret")
+        declared = call.get("inputs", {})
+        require(set(declared) == {"client-id"} and declared["client-id"].get("type") == "string"
+                and declared["client-id"].get("required") is True, "client-id input only")
+        job = jobs["merge"]
+        require(job.get("permissions") == {} and "needs" not in job and "if" not in job,
+                "merge uses only the App token and always runs")
+        require(job.get("environment") == {"name": "production", "deployment": False},
+                "the App key stays behind the production environment")
+        steps = job.get("steps", [])
+        require(steps and steps[0].get("id") == "plan" and steps[0].get("env") == {"CLIENT_ID": "${{ inputs.client-id }}"},
+                "validation must run first and read client-id through env")
+        require('"$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main' in steps[0].get("run", ""),
+                "main pushes only")
+        for step in steps[1:]:
+            require("inputs." not in repr(step), "raw inputs may only enter the validation step through env")
+        token = next((s for s in steps if s.get("uses", "").startswith("actions/create-github-app-token@")), None)
+        require(token is not None and set(token.get("with", {})) == {"client-id", "private-key", "permission-contents",
+                "permission-pull-requests"}, "App token scoped to contents and pull requests")
+        run = " ".join(s.get("run", "") for s in steps)
+        for needle in ("release-please--branches--main", "verbanium-ci[bot]", '"--auto"', '"--match-head-commit"',
+                       '"--squash"', "MANIFEST_LINE", "VERSION_LINE"):
+            require(needle in run, "release PR guard required: " + needle)
+        require("gh pr review" not in run and "--admin" not in run, "no approvals or admin merges")
     elif kind == "status":
         require(set(jobs) == {"status"}, "one status job required")
         require(not call.get("secrets"), "status workflow must not accept secrets")
@@ -524,6 +553,7 @@ def main():
         validate_reusable(load_yaml(root / ".github/workflows/release-notify.yml"), "notify")
         validate_reusable(load_yaml(root / ".github/workflows/deploy-coolify.yml"), "deploy")
         validate_reusable(load_yaml(root / ".github/workflows/status.yml"), "status")
+        validate_reusable(load_yaml(root / ".github/workflows/release-pr-merge.yml"), "merge")
         if args.snapshot:
             for path in paths:
                 target = args.snapshot / path
