@@ -520,6 +520,12 @@ caller run, then record the evidence in the retention rollout.
 
 ## README status block
 
+**Current mode (owner decision 2026-11-01, option C):** no status commits to `main`. Product READMEs
+carry a **static** block (links to Deployments, Releases, the site, monitoring and the CI badge) that
+never changes; live state comes from GitHub Deployments and Releases. The commit step below runs only
+when a caller sets `commit-readme: true` (default `false`), kept for a later option A with a dedicated
+App and a ruleset bypass.
+
 Caller repositories that publish releases and move `deployed-*` tags can refresh a Markdown table in
 `README.md` between `<!-- status:start -->` and `<!-- status:end -->`. The reusable
 `.github/workflows/status.yml` workflow:
