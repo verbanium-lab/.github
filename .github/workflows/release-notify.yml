@@ -1,0 +1,118 @@
+# Posts every new version released by release-please in the caller repository to the Telegram topic
+# "Deployment and releases" (ADR 0009 amendment 2026-11-01 (b): one version scheme, .github#26).
+# release-please itself runs in the caller (it needs the caller's verbanium-ci App key); this
+# workflow only reads the created tags and notifies. A failed notice never fails the release.
+#
+# Caller example (after release-please):
+#   notify:
+#     needs: release-please
+#     if: ${{ needs.release-please.outputs.tags != '' }}
+#     permissions:
+#       contents: read
+#     secrets:
+#       TELEGRAM_RELEASES_BOT_TOKEN: ${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}
+#     uses: verbanium-lab/.github/.github/workflows/release-notify.yml@REVIEWED_WORKFLOW_COMMIT
+#     with:
+#       tags: ${{ needs.release-please.outputs.tags }}
+
+name: Release notify
+
+on:
+  workflow_call:
+    inputs:
+      tags:
+        description: Whitespace-separated release tags `<component>-vX.Y.Z` created by this run
+        required: true
+        type: string
+    secrets:
+      TELEGRAM_RELEASES_BOT_TOKEN:
+        description: Telegram bot token for the Deployment and releases topic; omit to skip
+        required: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  notify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Validate tags and event boundary
+        id: plan
+        env:
+          TAGS: ${{ inputs.tags }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          OWNER: ${{ github.repository_owner }}
+          SERVER: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import html
+          import json
+          import os
+          import re
+          def require(ok, message):
+              if not ok:
+                  raise SystemExit(message)
+          env = os.environ
+          require(env['OWNER'] == 'verbanium-lab', 'Organization repository required')
+          require(env['EVENT'] == 'push' and env['REF'] == 'refs/heads/main', 'Main push required')
+          require(re.fullmatch(r'verbanium-lab/[A-Za-z0-9._-]{1,100}', env['REPOSITORY']), 'Invalid repository')
+          tags = env['TAGS'].split()
+          require(0 < len(tags) <= 20 and len(set(tags)) == len(tags), 'One to twenty distinct tags required')
+          messages = []
+          for tag in tags:
+              match = re.fullmatch(r'([a-z0-9][a-z0-9_-]{0,62})-v(\d{1,6}\.\d{1,6}\.\d{1,6}(?:-[0-9A-Za-z.]{1,40})?)', tag)
+              require(match, 'Invalid release tag')
+              component, version = match[1], match[2]
+              url = env['SERVER'] + '/' + env['REPOSITORY'] + '/releases/tag/' + tag
+              messages.append(
+                  f'<b>{html.escape(component)}</b> v{html.escape(version)}\n'
+                  f'{html.escape(env["REPOSITORY"])}\n'
+                  f'<a href="{html.escape(url, quote=True)}">Release notes</a>'
+              )
+          with open(env['GITHUB_OUTPUT'], 'a') as output:
+              print('messages<<MESSAGES_EOF', json.dumps(messages), 'MESSAGES_EOF', sep='\n', file=output)
+              print('count=' + str(len(messages)), file=output)
+          PY
+      - name: Notify Telegram
+        env:
+          TELEGRAM_RELEASES_BOT_TOKEN: ${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}
+          CHAT_ID: ${{ vars.TELEGRAM_RELEASES_CHAT_ID }}
+          THREAD_ID: ${{ vars.TELEGRAM_RELEASES_THREAD_ID }}
+          MESSAGES: ${{ steps.plan.outputs.messages }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TELEGRAM_RELEASES_BOT_TOKEN:-}" ]]; then
+            echo "Telegram skipped: TELEGRAM_RELEASES_BOT_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ ! "${CHAT_ID:-}" =~ ^-?[0-9]+$ || ! "${THREAD_ID:-}" =~ ^[0-9]+$ ]]; then
+            echo "Telegram skipped: TELEGRAM_RELEASES_CHAT_ID or TELEGRAM_RELEASES_THREAD_ID is not set or invalid." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+          env = os.environ
+          url = 'https://api.telegram.org/bot' + env['TELEGRAM_RELEASES_BOT_TOKEN'] + '/sendMessage'
+          sent = 0
+          for text in json.loads(env['MESSAGES']):
+              body = json.dumps({'chat_id': env['CHAT_ID'], 'message_thread_id': int(env['THREAD_ID']),
+                                 'parse_mode': 'HTML', 'disable_web_page_preview': True, 'text': text}).encode()
+              request = urllib.request.Request(url, data=body, headers={'Content-Type': 'application/json'})
+              try:
+                  with urllib.request.urlopen(request, timeout=15) as response:
+                      sent += response.status == 200
+              except Exception as error:  # A failed notice never fails the release.
+                  print('::warning::Telegram notification failed: ' + type(error).__name__)
+          with open(env['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              print(f'Telegram notifications sent: {sent}', file=summary)
+          PY
