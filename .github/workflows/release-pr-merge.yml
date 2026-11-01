@@ -1,0 +1,140 @@
+# Merges the caller repository's open release-please Release PR once its required checks pass
+# (owner decision 2026-11-01: the Release PR is a technical registration of a release; the owner
+# reviews code in the feature PRs, so the Release PR must not block releases).
+#
+# Safety boundary — the PR is merged only when ALL hold, otherwise it is left for the owner:
+#   - event is a push to main of the caller repository;
+#   - head branch `release-please--branches--main` in the same repository, base `main`, not draft;
+#   - author is the verbanium-ci App (`verbanium-ci[bot]`);
+#   - every changed file is release metadata: `.release-please-manifest.json`, `CHANGELOG.md`,
+#     `package.json`, `package-lock.json`, `version.txt`; in the JSON files every changed line is a
+#     `"version"` field (manifest: a `"<path>": "<semver>"` entry). Anything else → skip.
+# The merge is GitHub auto-merge (`--squash --match-head-commit`): GitHub merges only after the
+# required checks (org ruleset `ci-required`, which has no bypass) pass on exactly the checked head.
+# The org ruleset `main` lets the verbanium-ci App bypass the approval rule for PR merges only
+# (infra github/repositories.json). Nothing else gets merged by this workflow.
+#
+# Caller example (release.yml, after the release-please job):
+#   release-pr-merge:
+#     needs: release-please
+#     permissions: {}
+#     uses: verbanium-lab/.github/.github/workflows/release-pr-merge.yml@REVIEWED_WORKFLOW_COMMIT
+#     secrets:
+#       VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+#     with:
+#       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+
+name: Release PR merge
+
+on:
+  workflow_call:
+    inputs:
+      client-id:
+        description: verbanium-ci App client ID (vars.VERBANIUM_CI_CLIENT_ID of the caller)
+        required: true
+        type: string
+    secrets:
+      VERBANIUM_CI_PRIVATE_KEY:
+        description: verbanium-ci App private key (organization secret)
+        required: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    # The verbanium-ci key is used on main only, behind the production environment's branch rule.
+    environment:
+      name: production
+      deployment: false
+    steps:
+      - name: Check event boundary
+        id: plan
+        env:
+          CLIENT_ID: ${{ inputs.client-id }}
+        run: |
+          [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]] \
+            || { echo "::error::release PR merge runs on pushes to main only"; exit 1; }
+          [[ "$CLIENT_ID" =~ ^Iv[0-9A-Za-z.]{10,40}$ ]] || { echo "::error::invalid client-id"; exit 1; }
+          echo "client-id=$CLIENT_ID" >> "$GITHUB_OUTPUT"
+      - name: Mint verbanium-ci token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ steps.plan.outputs.client-id }}
+          private-key: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Check the Release PR and enable auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          owner = os.environ["GITHUB_REPOSITORY_OWNER"]
+          summary = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          HEAD = "release-please--branches--main"
+          AUTHOR = "verbanium-ci[bot]"
+          META = re.compile(r"^(?:.+/)?(?:CHANGELOG\.md|package\.json|package-lock\.json|version\.txt)$|^\.release-please-manifest\.json$")
+          VERSION_LINE = re.compile(r'^[+-]\s*"version":\s*"[0-9A-Za-z.+-]+",?\s*$')
+          MANIFEST_LINE = re.compile(r'^[+-]\s*"[A-Za-z0-9._/-]+":\s*"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?",?\s*$')
+          TEXT_LINE = re.compile(r"^[+-]\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\s*$")
+
+          def api(path):
+              out = subprocess.run(["gh", "api", "--paginate", "--slurp", path],
+                                   capture_output=True, text=True, check=True).stdout
+              pages = json.loads(out)
+              return [item for page in pages for item in page]
+
+          def say(message):
+              print(message)
+              summary.write(message + "\n")
+
+          prs = api(f"repos/{repo}/pulls?state=open&base=main&head={owner}:{HEAD}&per_page=100")
+          if not prs:
+              say("No open Release PR — nothing to merge.")
+              sys.exit(0)
+          if len(prs) != 1:
+              say(f"::warning::{len(prs)} open Release PRs — left for the owner.")
+              sys.exit(0)
+          pr = prs[0]
+          number, sha = pr["number"], pr["head"]["sha"]
+          reasons = []
+          if pr["user"]["login"] != AUTHOR or pr["user"]["type"] != "Bot":
+              reasons.append(f"author {pr['user']['login']} is not {AUTHOR}")
+          if pr["head"]["repo"] is None or pr["head"]["repo"]["full_name"] != repo:
+              reasons.append("head is not in this repository")
+          if pr["draft"]:
+              reasons.append("draft")
+          files = api(f"repos/{repo}/pulls/{number}/files?per_page=100")
+          if not files or len(files) > 60:
+              reasons.append(f"{len(files)} changed files")
+          for f in files:
+              name = f["filename"]
+              if not META.match(name) or f["status"] not in ("modified", "added"):
+                  reasons.append(f"{name}: not release metadata ({f['status']})"); continue
+              if name.endswith("CHANGELOG.md"):
+                  continue
+              patch = f.get("patch")
+              if patch is None:
+                  reasons.append(f"{name}: no diff available"); continue
+              rule = MANIFEST_LINE if name == ".release-please-manifest.json" else (
+                  TEXT_LINE if name.endswith("version.txt") else VERSION_LINE)
+              for line in patch.splitlines():
+                  if line.startswith(("+", "-")) and not line.startswith(("+++", "---")) and not rule.match(line):
+                      reasons.append(f"{name}: changes more than the version"); break
+          if reasons:
+              say(f"::warning::Release PR #{number} left for the owner: " + "; ".join(reasons))
+              sys.exit(0)
+          subprocess.run(["gh", "pr", "merge", str(number), "--repo", repo, "--squash", "--auto",
+                          "--match-head-commit", sha], check=True)
+          say(f"Release PR #{number} ({sha[:7]}): auto-merge enabled; GitHub merges it when the required checks pass.")
+          PY

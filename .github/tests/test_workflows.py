@@ -52,6 +52,38 @@ RELEASE = embedded_python('.github/workflows/release.yml', 'Validate inputs and 
 NOTIFY = embedded_python('.github/workflows/release-notify.yml', 'Validate tags and event boundary')
 RETENTION = embedded_python('.github/workflows/ghcr-cleanup.yml', 'Protect the latest ten sha tags')
 AFFECTED = embedded_python('docs/reusable-workflows.md', 'Select affected images')
+RELEASE_PR = embedded_python('.github/workflows/release-pr-merge.yml', 'Check the Release PR and enable auto-merge')
+
+FAKE_GH = '''#!/usr/bin/env python3
+import json, os, sys
+d = os.environ["FAKE_DIR"]
+args = sys.argv[1:]
+if args[:1] == ["api"]:
+    path = args[-1]
+    name = "files" if "/files" in path else "pulls"
+    print(json.dumps([json.load(open(os.path.join(d, name + ".json")))]))
+elif args[:2] == ["pr", "merge"]:
+    open(os.path.join(d, "merge.log"), "a").write(" ".join(args) + "\\n")
+else:
+    sys.exit(2)
+'''
+
+GOOD_FILES = [
+    dict(filename='.release-please-manifest.json', status='modified',
+         patch='@@ -1 +1 @@\n-  "portal": "1.7.1"\n+  "portal": "1.7.2"'),
+    dict(filename='portal/CHANGELOG.md', status='modified', patch='@@\n+## 1.7.2\n+* anything'),
+    dict(filename='portal/package.json', status='modified',
+         patch='@@\n {\n-  "version": "1.7.1",\n+  "version": "1.7.2",\n   "private": true,'),
+    dict(filename='portal/package-lock.json', status='modified',
+         patch='@@\n-  "version": "1.7.1",\n+  "version": "1.7.2",\n-      "version": "1.7.1",\n+      "version": "1.7.2",'),
+]
+
+
+def release_pr(**changes):
+    pr = dict(number=167, draft=False, user=dict(login='verbanium-ci[bot]', type='Bot'),
+              head=dict(sha='b' * 40, repo=dict(full_name='verbanium-lab/wiki')))
+    pr.update(changes)
+    return pr
 
 
 class WorkflowBehaviorTests(unittest.TestCase):
@@ -285,6 +317,55 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 result, values = self.notify(**changes)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(values, {})
+
+    def release_merge(self, pulls, files):
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            (d / 'gh').write_text(FAKE_GH)
+            (d / 'gh').chmod(0o755)
+            (d / 'pulls.json').write_text(json.dumps(pulls))
+            (d / 'files.json').write_text(json.dumps(files))
+            env = dict(PATH=f"{d}:{os.environ['PATH']}", FAKE_DIR=str(d), GITHUB_REPOSITORY='verbanium-lab/wiki',
+                       GITHUB_REPOSITORY_OWNER='verbanium-lab', GITHUB_STEP_SUMMARY=str(d / 'summary'))
+            result = subprocess.run([sys.executable, '-c', RELEASE_PR], env=env, capture_output=True, text=True)
+            log = (d / 'merge.log').read_text() if (d / 'merge.log').exists() else ''
+            return result, log
+
+    def test_release_pr_metadata_only_is_auto_merged_at_the_checked_head(self):
+        result, log = self.release_merge([release_pr()], GOOD_FILES)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pr merge 167 --repo verbanium-lab/wiki --squash --auto --match-head-commit ' + 'b' * 40, log)
+
+    def test_release_pr_absent_or_ambiguous_is_left_alone(self):
+        for pulls in ([], [release_pr(), release_pr(number=168)]):
+            with self.subTest(count=len(pulls)):
+                result, log = self.release_merge(pulls, GOOD_FILES)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log, '')
+
+    def test_release_pr_outside_the_boundary_is_left_for_the_owner(self):
+        code = dict(filename='portal/app/page.tsx', status='modified', patch='@@\n+evil()')
+        dependency = dict(filename='portal/package.json', status='modified',
+                          patch='@@\n-    "next": "16.0.0",\n+    "next": "16.0.1",')
+        manifest = dict(filename='.release-please-manifest.json', status='modified',
+                        patch='@@\n-  "portal": "1.7.1"\n+  "portal": "1.7.2", "x": 1')
+        removed = dict(filename='portal/CHANGELOG.md', status='removed', patch='')
+        for pulls, files in (
+            ([release_pr(user=dict(login='someone', type='User'))], GOOD_FILES),
+            ([release_pr(head=dict(sha='b' * 40, repo=dict(full_name='fork/wiki')))], GOOD_FILES),
+            ([release_pr(head=dict(sha='b' * 40, repo=None))], GOOD_FILES),
+            ([release_pr(draft=True)], GOOD_FILES),
+            ([release_pr()], GOOD_FILES + [code]),
+            ([release_pr()], [dependency]),
+            ([release_pr()], [manifest]),
+            ([release_pr()], [removed]),
+            ([release_pr()], []),
+            ([release_pr()], [dict(filename='portal/package.json', status='modified')]),
+        ):
+            with self.subTest(files=[f['filename'] for f in files], pr=pulls[0]['user']['login']):
+                result, log = self.release_merge(pulls, files)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log, '')
 
     def retention(self, pages, package='wiki'):
         with tempfile.TemporaryDirectory() as directory:
