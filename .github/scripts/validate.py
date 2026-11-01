@@ -443,6 +443,12 @@ def validate_reusable(workflow, kind):
                 require("inputs." not in text, "raw inputs may only enter the plan step through env")
             used = set(re.findall(r"secrets\.([A-Z0-9_]+)", text))
             require(used <= allowed_secrets.get(name, set()), "secrets only in the record and deploy jobs")
+        guard = (jobs["deploy"].get("steps") or [{}])[0]
+        deploy_secrets = ("TS_OAUTH_CLIENT_ID", "TS_AUDIENCE", "COOLIFY_DEPLOY_TOKEN")
+        require(guard.get("env") == {n: "${{ secrets." + n + " }}" for n in deploy_secrets}
+                and all(n in guard.get("run", "") for n in deploy_secrets)
+                and "secrets: inherit" in guard.get("run", "") and "exit 1" in guard.get("run", ""),
+                "the deploy job must first fail on empty environment secrets (callers need secrets: inherit)")
         deploy_run = " ".join(s.get("run", "") for s in jobs["deploy"]["steps"])
         require("COOLIFY_URL/api/v1/applications/$APP_UUID" in deploy_run and "api/v1/deploy?uuid=$APP_UUID" in deploy_run,
                 "Coolify API deploy required")

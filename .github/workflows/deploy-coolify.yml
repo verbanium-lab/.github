@@ -6,11 +6,13 @@
 #   deploy  joins the tailnet as an ephemeral tag:ci node (Tailscale workload identity, no stored
 #           key), sets the digest as the Coolify image tag, deploys, waits for Coolify, then waits
 #           until the live site reports this commit.
-# The deploy secrets are never passed by the caller: the record and deploy jobs run in the
-# caller's environment (default `production`, main-only branch policy) and read its environment
-# secrets TS_OAUTH_CLIENT_ID, TS_AUDIENCE and COOLIFY_DEPLOY_TOKEN there. The verbanium-ci App key
-# is an organization secret in some repositories (wiki): the caller passes it as the one optional
-# secret; an environment secret of the same name takes precedence (GitHub's rule).
+# The deploy secrets TS_OAUTH_CLIENT_ID, TS_AUDIENCE and COOLIFY_DEPLOY_TOKEN are secrets of the
+# caller's environment (default `production`, main-only branch policy); the record and deploy jobs
+# run in that environment. The calling job must use `secrets: inherit`: without it GitHub resolves
+# environment secrets in a reusable workflow as empty, even though the job names the environment
+# (actions/runner#4453; wiki run 41306724863). The verbanium-ci App key comes the same way, from
+# the environment or the organization. The deploy job checks the secrets first and fails with
+# this explanation instead of a Tailscale error.
 # Callers keep this out of their required `ci` gate: a failed deploy must not block merging a fix.
 #
 # Caller example (after the shared image workflow):
@@ -32,8 +34,7 @@
 #       verify-url: https://studio.verbanium.dev/healthz
 #       verify-json-field: sha
 #       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
-#     secrets:
-#       VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+#     secrets: inherit # zizmor: ignore[secrets-inherit] environment secrets need it (see above)
 
 name: Deploy to Coolify
 
@@ -91,21 +92,20 @@ on:
         description: Client ID of the verbanium-ci GitHub App
         required: true
         type: string
-    # All optional and normally not passed: the jobs below run in the caller's environment, whose
-    # secrets of the same names take precedence. Only the App key may come from the caller, where it
-    # is an organization secret (wiki). Declared so that the names are reviewed (actionlint).
+    # All optional; the caller passes them with `secrets: inherit` (environment and organization
+    # secrets). Declared so that the names are reviewed (actionlint).
     secrets:
       VERBANIUM_CI_PRIVATE_KEY:
-        description: verbanium-ci App key; an environment secret of the same name takes precedence
+        description: verbanium-ci App key (environment or organization secret, via secrets inherit)
         required: false
       TS_OAUTH_CLIENT_ID:
-        description: Environment secret of the caller; do not pass
+        description: Environment secret of the caller, via secrets inherit
         required: false
       TS_AUDIENCE:
-        description: Environment secret of the caller; do not pass
+        description: Environment secret of the caller, via secrets inherit
         required: false
       COOLIFY_DEPLOY_TOKEN:
-        description: Environment secret of the caller; do not pass
+        description: Environment secret of the caller, via secrets inherit
         required: false
 
 permissions: {}
@@ -241,6 +241,21 @@ jobs:
       group: deploy-${{ needs.plan.outputs.app }}-${{ needs.plan.outputs.environment }}
       cancel-in-progress: false
     steps:
+      - name: Check the environment secrets
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_AUDIENCE: ${{ secrets.TS_AUDIENCE }}
+          COOLIFY_DEPLOY_TOKEN: ${{ secrets.COOLIFY_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in TS_OAUTH_CLIENT_ID TS_AUDIENCE COOLIFY_DEPLOY_TOKEN; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::empty deploy secrets: ${missing[*]}. Set them in the caller's environment and call this workflow with 'secrets: inherit' (environment secrets are empty in a reusable workflow otherwise, actions/runner#4453)."
+            exit 1
+          fi
       - name: Join the tailnet (ephemeral, tag:ci)
         uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
         with:

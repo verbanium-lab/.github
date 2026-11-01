@@ -580,14 +580,16 @@ amendment 2026-10-28; .github#25). Its three jobs:
 | --- | --- | --- |
 | `plan` | none | Validates every input against the run: main push, `image-tags` is `<image>:sha-<this commit>`, `sha7` is this commit, the digest, the Coolify UUID, https `verbanium.dev` URLs, the environment and the App client ID. Later jobs read only its outputs. |
 | `record` | none (App token) | Creates the GitHub Deployment with the verbanium-ci App in the caller's environment (`deployment: false`). |
-| `deploy` | `id-token: write` | Joins the tailnet as an ephemeral `tag:ci` node (Tailscale workload identity), sets `sha256-<hex>` as the Coolify image tag, deploys, waits up to 10 minutes for Coolify, then up to 5 minutes for `verify-url` to report `sha7`. Deploys of one app and environment queue (`cancel-in-progress: false`). |
+| `deploy` | `id-token: write` | Fails first if a deploy secret is empty, then joins the tailnet as an ephemeral `tag:ci` node (Tailscale workload identity), sets `sha256-<hex>` as the Coolify image tag, deploys, waits up to 10 minutes for Coolify, then up to 5 minutes for `verify-url` to report `sha7`. Deploys of one app and environment queue (`cancel-in-progress: false`). |
 
-GitHub gives a reusable job that names an environment the caller repository's secrets of that
-environment, so `TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` must be environment
-secrets of `production` (main-only branch policy); the caller cannot pass them. The verbanium-ci
-App key is the one optional workflow secret: the wiki keeps it as an organization secret, so its
-caller passes `VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}`; an environment
-secret of the same name (Studio) takes precedence.
+`TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` are environment secrets of
+`production` (main-only branch policy); the verbanium-ci App key is an environment secret (Studio)
+or an organization secret (wiki). The calling job must use `secrets: inherit`. Naming the
+environment in the reusable job is not enough: without `inherit` GitHub resolves environment
+secrets as empty there ([actions/runner#4453](https://github.com/actions/runner/issues/4453)); the
+first wiki deploy failed this way (run 41306724863). The deploy job checks the three secrets first
+and fails with this explanation. zizmor flags `secrets: inherit`; the caller line carries a
+reviewed `zizmor: ignore[secrets-inherit]`.
 
 | Input | Required | Meaning |
 | --- | --- | --- |
@@ -621,8 +623,7 @@ secret of the same name (Studio) takes precedence.
       verify-url: https://studio.verbanium.dev/healthz
       verify-json-field: sha
       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
-    secrets:
-      VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+    secrets: inherit # zizmor: ignore[secrets-inherit] environment secrets need it
 ```
 
 The wiki reports the build in the page footer, so it passes `verify-url: https://wiki.verbanium.dev/`

@@ -384,10 +384,13 @@ class DeployBoundaryTests(unittest.TestCase):
             lambda w: w[True]['workflow_call']['inputs'].update(extra={'type': 'string'}),
             lambda w: w[True]['workflow_call']['inputs']['environment'].update(default='staging'),
             lambda w: w['jobs']['deploy']['concurrency'].update({'cancel-in-progress': True}),
-            lambda w: w['jobs']['deploy']['steps'][1]['env'].update(APP_UUID='${{ inputs.coolify-app-uuid }}'),
+            lambda w: w['jobs']['deploy']['steps'][2]['env'].update(APP_UUID='${{ inputs.coolify-app-uuid }}'),
             lambda w: w['jobs']['plan']['steps'][0]['env'].update(TOKEN='${{ secrets.COOLIFY_DEPLOY_TOKEN }}'),
             lambda w: w['jobs']['record']['steps'][1]['env'].update(TOKEN='${{ secrets.COOLIFY_DEPLOY_TOKEN }}'),
-            lambda w: w['jobs']['deploy']['steps'][0]['with'].update(tags='tag:admin'),
+            lambda w: w['jobs']['deploy']['steps'][1]['with'].update(tags='tag:admin'),
+            lambda w: w['jobs']['deploy']['steps'].pop(0),
+            lambda w: w['jobs']['deploy']['steps'][0]['env'].pop('TS_AUDIENCE'),
+            lambda w: w['jobs']['deploy']['steps'][0].update(run='echo ok'),
             lambda w: w['jobs']['plan']['steps'][0].update(run='echo ok'),
         ):
             bad = copy.deepcopy(base)
