@@ -459,7 +459,11 @@ def validate_reusable(workflow, kind):
         require(set(jobs) == {"status"}, "one status job required")
         require(not call.get("secrets"), "status workflow must not accept secrets")
         declared = call.get("inputs", {})
-        require(set(declared) == {"apps", "coverage-artifact"}, "apps and coverage-artifact inputs required")
+        require(set(declared) == {"apps", "coverage-artifact", "commit-readme"},
+                "apps, coverage-artifact and commit-readme inputs required")
+        commit = declared.get("commit-readme", {})
+        require(commit.get("type") == "boolean" and commit.get("default") is False,
+                "commit-readme must be a boolean that defaults to false (option C)")
         apps = declared["apps"]
         require(apps.get("type") == "string" and apps.get("required") is True and "default" not in apps,
                 "required apps JSON input required")

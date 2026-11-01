@@ -362,5 +362,16 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
 
 
+class StatusWorkflowTests(unittest.TestCase):
+    """Option C (2026-11-01): the README commit is opt-in."""
+
+    def test_readme_commit_is_off_by_default(self):
+        text = (ROOT / '.github/workflows/status.yml').read_text()
+        block = text.split('commit-readme:', 1)[1].split('type: boolean', 1)[0]
+        self.assertIn('default: false', block)
+        step = text.split('- name: Commit status update', 1)[1].split('run:', 1)[0]
+        self.assertIn('inputs.commit-readme &&', step)
+
+
 if __name__ == '__main__':
     unittest.main()

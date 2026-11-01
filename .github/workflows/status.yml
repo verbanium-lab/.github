@@ -38,6 +38,13 @@ on:
         description: Optional workflow artifact name with coverage.json for report links
         default: ''
         type: string
+      commit-readme:
+        description: >-
+          Commit the rendered block to README.md. Off by default (owner decision 2026-11-01,
+          option C: no status commits to main; READMEs carry a static block). Kept for a later
+          option A with a dedicated App and ruleset bypass.
+        default: false
+        type: boolean
 
 permissions: {}
 
@@ -134,7 +141,7 @@ jobs:
       # If repository rules refuse the commit on the default branch, the same commit goes to a
       # bot/readme-status-<run> branch and a pull request with the same title is opened.
       - name: Commit status update
-        if: ${{ steps.render.outputs.changed == 'true' }}
+        if: ${{ inputs.commit-readme && steps.render.outputs.changed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
