@@ -2,7 +2,7 @@
 title: Public organization defaults
 owner: verbanium
 status: active
-last_reviewed: 2026-10-29
+last_reviewed: 2026-11-01
 ---
 
 # .github
@@ -15,6 +15,9 @@ GitHub applies to every repository without its own copy.
 | `.github/ISSUE_TEMPLATE/task.yml` | "Task" form: goal, scope, done when, how to verify, product, size, risk. Adds the `agent` label and Project 2 |
 | `.github/ISSUE_TEMPLATE/config.yml` | Disables blank issues |
 | `.github/pull_request_template.md` | PR template: `Closes #N`, what changed, how it was verified |
+| `SECURITY.md` | Default security policy: private reports through GitHub on this repository |
+| `profile/README.md` | Public organization profile on github.com/verbanium-lab |
+| `LICENSE` | MIT for this repository; other repositories carry their own `LICENSE` |
 
 GitHub applies these defaults to other repositories only while the `.github` repository is public.
 
@@ -30,7 +33,8 @@ local check and the owner-controlled activation steps.
 | [ghcr-cleanup.yml](.github/workflows/ghcr-cleanup.yml) | Per-package retention with protected release/deployed tags; dry-run by default |
 | [deployed-tag.yml](.github/workflows/deployed-tag.yml) | Moves `deployed-<env>` to the digest that runs in an environment, without pulling layers |
 | [status.yml](.github/workflows/status.yml) | Refreshes the README status table from releases, GHCR deployed tags and optional coverage |
-| [release.yml](.github/workflows/release.yml) | GitHub Release per main image build (`<slug>-<YYYY.MM.DD>-<sha7>`) and optional Telegram notify |
+| [release-notify.yml](.github/workflows/release-notify.yml) | Telegram notice for every `<component>-vX.Y.Z` tag that release-please created in the caller |
+| [release.yml](.github/workflows/release.yml) | **Deprecated** (one SemVer scheme, ADR 0009 amendment 2026-11-01 b): date-sha release per main image; no callers left |
 
 See [caller recipes and adoption requirements](docs/reusable-workflows.md) for fixed-app wiki and
 affected-matrix Tower examples, release-commit filters and token boundaries. Unresolved action pins
@@ -88,7 +92,30 @@ Run it from the default branch with the image, the deployed `sha256:` digest and
 Inputs are validated strictly and the job fails if the tag does not resolve to the digest afterwards.
 See [the guide](docs/reusable-workflows.md#protect-the-deployed-digest).
 
-## Release after image (main)
+## Releases (SemVer)
+
+Every app and package releases with release-please in its own repository: tags
+`<component>-vX.Y.Z`, a CHANGELOG per component, the Release PR opened with the verbanium-ci App
+token in the `production` environment. After release-please, the caller collects the created tags
+and calls `release-notify.yml` (pinned by a reviewed full commit SHA):
+
+```yaml
+  notify:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.tags != '' }}
+    permissions:
+      contents: read
+    secrets:
+      TELEGRAM_RELEASES_BOT_TOKEN: ${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}
+    uses: verbanium-lab/.github/.github/workflows/release-notify.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      tags: ${{ needs.release-please.outputs.tags }}
+```
+
+Callers: wiki, packages, verbanium-templates (Studio), iblonda-apps, tower-apps, verbanium-apps.
+Build number, UTC date and sha7 are build metadata (footer, `/healthz`, image tags), not versions.
+
+## Release after image (main), deprecated
 
 Pin `release.yml` by a reviewed full commit SHA. Run it in the caller repository on every successful
 main image publication. Pass the image workflow outputs and grant `contents: write` on the release job.
