@@ -1,0 +1,281 @@
+# Deploys a main image to a Coolify application over the tailnet (ADR 0009 amendment 2026-10-28;
+# .github#25). Three jobs:
+#   plan    validates every input against the run (the image tag is `sha-<this commit>`, sha7 is
+#           this commit) and hands the validated values on as outputs;
+#   record  creates the GitHub Deployment with the verbanium-ci App (Tower reads it later);
+#   deploy  joins the tailnet as an ephemeral tag:ci node (Tailscale workload identity, no stored
+#           key), sets the digest as the Coolify image tag, deploys, waits for Coolify, then waits
+#           until the live site reports this commit.
+# Secrets are never passed by the caller: the record and deploy jobs run in the caller's
+# environment (default `production`, main-only branch policy) and read its environment secrets
+# VERBANIUM_CI_PRIVATE_KEY, TS_OAUTH_CLIENT_ID, TS_AUDIENCE and COOLIFY_DEPLOY_TOKEN there.
+# Callers keep this out of their required `ci` gate: a failed deploy must not block merging a fix.
+#
+# Caller example (after the shared image workflow):
+#   deploy:
+#     name: deploy (studio)
+#     needs: [checks, image-main]
+#     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+#     permissions:
+#       id-token: write
+#     uses: verbanium-lab/.github/.github/workflows/deploy-coolify.yml@REVIEWED_WORKFLOW_COMMIT
+#     with:
+#       app: studio
+#       image: ${{ needs.image-main.outputs.image }}
+#       digest: ${{ needs.image-main.outputs.digest }}
+#       image-tags: ${{ needs.image-main.outputs.tags }}
+#       sha7: ${{ needs.checks.outputs.sha7 }}
+#       coolify-app-uuid: ${{ vars.STUDIO_COOLIFY_APP_UUID }}
+#       site-url: https://studio.verbanium.dev
+#       verify-url: https://studio.verbanium.dev/healthz
+#       verify-json-field: sha
+#       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+
+name: Deploy to Coolify
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: App slug, e.g. wiki or studio
+        required: true
+        type: string
+      image:
+        description: Image without tag or digest, ghcr.io/verbanium-lab/<name>
+        required: true
+        type: string
+      digest:
+        description: OCI index digest from the image workflow, sha256:<64 hex>
+        required: true
+        type: string
+      image-tags:
+        description: Tags output of the image workflow; must be <image>:sha-<this commit>
+        required: true
+        type: string
+      sha7:
+        description: Short commit the live site must report
+        required: true
+        type: string
+      build-number:
+        description: Build number (commits on main) for the record; empty when the app has none
+        required: false
+        type: string
+        default: ''
+      coolify-app-uuid:
+        description: Coolify application UUID
+        required: true
+        type: string
+      site-url:
+        description: Public URL of the application, shown on the environment
+        required: true
+        type: string
+      verify-url:
+        description: URL fetched after the deploy until it reports sha7
+        required: true
+        type: string
+      verify-json-field:
+        description: JSON field of verify-url that holds sha7; empty = the page text contains sha7
+        required: false
+        type: string
+        default: ''
+      environment:
+        description: GitHub environment that holds the deploy secrets
+        required: false
+        type: string
+        default: production
+      client-id:
+        description: Client ID of the verbanium-ci GitHub App
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      app: ${{ steps.plan.outputs.app }}
+      image: ${{ steps.plan.outputs.image }}
+      digest: ${{ steps.plan.outputs.digest }}
+      label: ${{ steps.plan.outputs.label }}
+      sha7: ${{ steps.plan.outputs.sha7 }}
+      build-number: ${{ steps.plan.outputs.build-number }}
+      app-uuid: ${{ steps.plan.outputs.app-uuid }}
+      site-url: ${{ steps.plan.outputs.site-url }}
+      verify-url: ${{ steps.plan.outputs.verify-url }}
+      verify-json-field: ${{ steps.plan.outputs.verify-json-field }}
+      environment: ${{ steps.plan.outputs.environment }}
+      client-id: ${{ steps.plan.outputs.client-id }}
+    steps:
+      - name: Validate inputs against this run
+        id: plan
+        env:
+          APP: ${{ inputs.app }}
+          IMAGE: ${{ inputs.image }}
+          DIGEST: ${{ inputs.digest }}
+          TAGS: ${{ inputs.image-tags }}
+          SHA7: ${{ inputs.sha7 }}
+          BUILD_NUMBER: ${{ inputs.build-number }}
+          APP_UUID: ${{ inputs.coolify-app-uuid }}
+          SITE_URL: ${{ inputs.site-url }}
+          VERIFY_URL: ${{ inputs.verify-url }}
+          VERIFY_FIELD: ${{ inputs.verify-json-field }}
+          TARGET_ENV: ${{ inputs.environment }}
+          CLIENT_ID: ${{ inputs.client-id }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$GITHUB_REPOSITORY_OWNER" == verbanium-lab ]] || fail "verbanium-lab repositories only"
+          [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]] || fail "deploys run on main pushes only"
+          [[ "$APP" =~ ^[a-z][a-z0-9-]{1,30}$ ]] || fail "invalid app slug"
+          [[ "$IMAGE" =~ ^ghcr\.io/verbanium-lab/[a-z0-9][a-z0-9-]{0,62}$ ]] || fail "invalid image"
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]] || fail "invalid index digest"
+          [[ "$TAGS" == "$IMAGE:sha-$GITHUB_SHA" ]] || fail "image tag is not sha-<this commit>"
+          [[ "$SHA7" == "${GITHUB_SHA::7}" ]] || fail "build sha7 does not match the commit"
+          [[ -z "$BUILD_NUMBER" || "$BUILD_NUMBER" =~ ^[1-9][0-9]{0,8}$ ]] || fail "invalid build number"
+          [[ "$APP_UUID" =~ ^[a-z0-9]{20,32}$ ]] || fail "invalid Coolify application UUID (repository variable not set?)"
+          url_re='^https://([a-z0-9-]+\.)*verbanium\.dev(/[A-Za-z0-9._~/-]*)?$'
+          [[ "$SITE_URL" =~ $url_re ]] || fail "site-url must be an https verbanium.dev URL"
+          [[ "$VERIFY_URL" =~ $url_re ]] || fail "verify-url must be an https verbanium.dev URL"
+          [[ -z "$VERIFY_FIELD" || "$VERIFY_FIELD" =~ ^[a-z][a-zA-Z0-9_]{0,30}$ ]] || fail "invalid verify-json-field"
+          [[ "$TARGET_ENV" =~ ^(production|release-candidate|dev)$ ]] || fail "unknown environment"
+          [[ "$CLIENT_ID" =~ ^Iv[0-9A-Za-z.]{8,40}$ ]] || fail "invalid GitHub App client ID"
+          {
+            echo "app=$APP"
+            echo "image=$IMAGE"
+            echo "digest=$DIGEST"
+            echo "label=${TAGS#"$IMAGE:"}"
+            echo "sha7=$SHA7"
+            echo "build-number=$BUILD_NUMBER"
+            echo "app-uuid=$APP_UUID"
+            echo "site-url=$SITE_URL"
+            echo "verify-url=$VERIFY_URL"
+            echo "verify-json-field=$VERIFY_FIELD"
+            echo "environment=$TARGET_ENV"
+            echo "client-id=$CLIENT_ID"
+          } >> "$GITHUB_OUTPUT"
+
+  # The GitHub Deployment record, created by the verbanium-ci App (ADR 0009). The App key is an
+  # environment secret of the caller (main-only); this record is the only deployment it creates.
+  record:
+    name: deployment record
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    environment:
+      name: ${{ needs.plan.outputs.environment }}
+      deployment: false
+    steps:
+      - name: Mint verbanium-ci token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ needs.plan.outputs.client-id }}
+          private-key: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+          permission-deployments: write
+      - name: Create GitHub Deployment
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP: ${{ needs.plan.outputs.app }}
+          IMAGE: ${{ needs.plan.outputs.image }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+          LABEL: ${{ needs.plan.outputs.label }}
+          SHA7: ${{ needs.plan.outputs.sha7 }}
+          BUILD_NUMBER: ${{ needs.plan.outputs.build-number }}
+          TARGET_ENV: ${{ needs.plan.outputs.environment }}
+        run: |
+          set -euo pipefail
+          jq -n --arg ref "$GITHUB_SHA" --arg env "$TARGET_ENV" --arg app "$APP" --arg image "$IMAGE" \
+            --arg digest "$DIGEST" --arg label "$LABEL" --arg sha7 "$SHA7" --arg number "$BUILD_NUMBER" '{
+              ref: $ref, environment: $env, auto_merge: false, required_contexts: [],
+              description: (if $number == "" then "\($app) \($sha7)" else "\($app) build \($number) (\($sha7))" end),
+              payload: {app: $app, image: $image, digest: $digest, sourceSha: $ref, label: $label,
+                        build: (if $number == "" then {sha7: $sha7} else {number: ($number | tonumber), sha7: $sha7} end)}
+            }' > "$RUNNER_TEMP/deployment.json"
+          id="$(gh api --method POST "repos/$GITHUB_REPOSITORY/deployments" \
+            --input "$RUNNER_TEMP/deployment.json" --jq '.id')"
+          [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::GitHub did not return a deployment id"; exit 1; }
+          {
+            echo "### $APP deployment record"
+            echo
+            echo "| Deployment | Environment | Build | Image |"
+            echo "| --- | --- | --- | --- |"
+            echo "| \`$id\` | \`$TARGET_ENV\` | \`${BUILD_NUMBER:-–}\` (\`$SHA7\`) | \`$IMAGE@$DIGEST\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: deploy
+    needs: [plan, record]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write # Tailscale workload identity (GitHub OIDC token)
+    environment:
+      name: ${{ needs.plan.outputs.environment }}
+      url: ${{ needs.plan.outputs.site-url }}
+    concurrency:
+      group: deploy-${{ needs.plan.outputs.app }}-${{ needs.plan.outputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - name: Join the tailnet (ephemeral, tag:ci)
+        uses: tailscale/github-action@d1b6cd204f8dceda5b3eaad7f1f767be390056cd # v4.2.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+      - name: Deploy the digest in Coolify and wait for the live build
+        env:
+          COOLIFY_URL: https://coolify.verbanium.dev
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_DEPLOY_TOKEN }}
+          APP: ${{ needs.plan.outputs.app }}
+          APP_UUID: ${{ needs.plan.outputs.app-uuid }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+          SHA7: ${{ needs.plan.outputs.sha7 }}
+          BUILD_NUMBER: ${{ needs.plan.outputs.build-number }}
+          VERIFY_URL: ${{ needs.plan.outputs.verify-url }}
+          VERIFY_FIELD: ${{ needs.plan.outputs.verify-json-field }}
+        run: |
+          set -euo pipefail
+          # Coolify's tag field takes the digest as sha256-<hex> (a colon is rejected).
+          tag="sha256-${DIGEST#sha256:}"
+          api() { curl -fsS --max-time 30 -H "Authorization: Bearer $COOLIFY_TOKEN" -H 'Content-Type: application/json' "$@"; }
+          api -X PATCH "$COOLIFY_URL/api/v1/applications/$APP_UUID" \
+            --data "$(jq -nc --arg tag "$tag" '{docker_registry_image_tag: $tag}')" > /dev/null
+          deployment="$(api -X POST "$COOLIFY_URL/api/v1/deploy?uuid=$APP_UUID" | jq -r '.deployments[0].deployment_uuid // empty')"
+          [[ -n "$deployment" ]] || { echo "::error::Coolify returned no deployment"; exit 1; }
+          echo "Coolify deployment $deployment for $tag"
+          status=unknown
+          for _ in $(seq 1 60); do
+            status="$(api "$COOLIFY_URL/api/v1/deployments/$deployment" | jq -r '.status // "unknown"')"
+            case "$status" in
+              finished) break ;;
+              failed|cancelled*) echo "::error::Coolify deployment $status"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          [[ "$status" == finished ]] || { echo "::error::Coolify deployment still $status after 10 minutes"; exit 1; }
+          live() {
+            local body
+            body="$(curl -fsS --max-time 15 "$VERIFY_URL")" || return 1
+            if [[ -n "$VERIFY_FIELD" ]]; then
+              [[ "$(jq -r --arg f "$VERIFY_FIELD" '.[$f] // empty' <<<"$body")" == "$SHA7" ]]
+            else
+              grep -qF "$SHA7" <<<"$body"
+            fi
+          }
+          for _ in $(seq 1 30); do
+            if live; then
+              {
+                echo "### $APP deployed"
+                echo
+                echo "Build \`${BUILD_NUMBER:-–}\` (\`$SHA7\`) is live at $VERIFY_URL — Coolify deployment \`$deployment\`, image tag \`$tag\`."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::$VERIFY_URL does not report $SHA7 five minutes after the deploy finished"; exit 1

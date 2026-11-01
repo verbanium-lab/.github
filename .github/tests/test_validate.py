@@ -153,7 +153,8 @@ class DefaultsTests(unittest.TestCase):
 
     def reusable(self, kind):
         name = {'image': 'image', 'cleanup': 'ghcr-cleanup', 'deployed': 'deployed-tag',
-                'release': 'release', 'notify': 'release-notify', 'status': 'status'}[kind]
+                'release': 'release', 'notify': 'release-notify', 'status': 'status',
+                'deploy': 'deploy-coolify'}[kind]
         workflow = validator.load_yaml(ROOT / f'.github/workflows/{name}.yml')
         # Synthetic pinned references isolate boundary rejection tests from the offline pin gate.
         for job in workflow['jobs'].values():
@@ -164,7 +165,7 @@ class DefaultsTests(unittest.TestCase):
         return workflow
 
     def test_reusable_rejects_unpinned_actions_and_interpolation(self):
-        for kind in ('image', 'cleanup', 'deployed', 'release', 'notify', 'status'):
+        for kind in ('image', 'cleanup', 'deployed', 'release', 'notify', 'status', 'deploy'):
             workflow = self.reusable(kind)
             for job in workflow['jobs'].values():
                 for step in job.get('steps', []):
@@ -351,10 +352,6 @@ class DefaultsTests(unittest.TestCase):
                     self.assertNotIn(token, result.stdout + result.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class NotifyBoundaryTests(unittest.TestCase):
     def test_notify_rejects_wider_boundaries(self):
         base = validator.load_yaml(ROOT / '.github/workflows/release-notify.yml')
@@ -372,3 +369,31 @@ class NotifyBoundaryTests(unittest.TestCase):
                 with self.assertRaises(validator.Invalid):
                     validator.validate_reusable(bad, 'notify')
 
+
+class DeployBoundaryTests(unittest.TestCase):
+    def test_deploy_rejects_wider_boundaries(self):
+        base = validator.load_yaml(ROOT / '.github/workflows/deploy-coolify.yml')
+        validator.validate_reusable(copy.deepcopy(base), 'deploy')
+        for mutate in (
+            lambda w: w['jobs']['deploy'].update(permissions={'id-token': 'write', 'contents': 'write'}),
+            lambda w: w['jobs']['record'].update(permissions={'deployments': 'write'}),
+            lambda w: w['jobs']['plan'].update(environment='production'),
+            lambda w: w[True]['workflow_call'].update(secrets={'COOLIFY_DEPLOY_TOKEN': {'required': True}}),
+            lambda w: w[True]['workflow_call']['inputs'].update(extra={'type': 'string'}),
+            lambda w: w[True]['workflow_call']['inputs']['environment'].update(default='staging'),
+            lambda w: w['jobs']['deploy']['concurrency'].update({'cancel-in-progress': True}),
+            lambda w: w['jobs']['deploy']['steps'][1]['env'].update(APP_UUID='${{ inputs.coolify-app-uuid }}'),
+            lambda w: w['jobs']['plan']['steps'][0]['env'].update(TOKEN='${{ secrets.COOLIFY_DEPLOY_TOKEN }}'),
+            lambda w: w['jobs']['record']['steps'][1]['env'].update(TOKEN='${{ secrets.COOLIFY_DEPLOY_TOKEN }}'),
+            lambda w: w['jobs']['deploy']['steps'][0]['with'].update(tags='tag:admin'),
+            lambda w: w['jobs']['plan']['steps'][0].update(run='echo ok'),
+        ):
+            bad = copy.deepcopy(base)
+            mutate(bad)
+            with self.subTest(workflow=bad):
+                with self.assertRaises(validator.Invalid):
+                    validator.validate_reusable(bad, 'deploy')
+
+
+if __name__ == "__main__":
+    unittest.main()
