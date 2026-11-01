@@ -33,6 +33,7 @@ local check and the owner-controlled activation steps.
 | [ghcr-cleanup.yml](.github/workflows/ghcr-cleanup.yml) | Per-package retention with protected release/deployed tags; dry-run by default |
 | [deployed-tag.yml](.github/workflows/deployed-tag.yml) | Moves `deployed-<env>` to the digest that runs in an environment, without pulling layers |
 | [status.yml](.github/workflows/status.yml) | Refreshes the README status table from releases, GHCR deployed tags and optional coverage |
+| [deploy-coolify.yml](.github/workflows/deploy-coolify.yml) | Deploys a main image digest to a Coolify application over an ephemeral tailnet node, records the GitHub Deployment, waits for the live build |
 | [release-notify.yml](.github/workflows/release-notify.yml) | Telegram notice for every `<component>-vX.Y.Z` tag that release-please created in the caller |
 | [release.yml](.github/workflows/release.yml) | **Deprecated** (one SemVer scheme, ADR 0009 amendment 2026-11-01 b): date-sha release per main image; no callers left |
 
@@ -91,6 +92,17 @@ jobs:
 Run it from the default branch with the image, the deployed `sha256:` digest and the environment.
 Inputs are validated strictly and the job fails if the tag does not resolve to the digest afterwards.
 See [the guide](docs/reusable-workflows.md#protect-the-deployed-digest).
+
+## Deploy to Coolify (main)
+
+`deploy-coolify.yml` replaces the deploy jobs copied between repositories (wiki, Studio). Pin it by
+a reviewed full commit SHA and call it after `image.yml` on main pushes; keep it out of the required
+`ci` job, so a failed deploy never blocks merging a fix. The caller grants only `id-token: write`
+and passes at most the verbanium-ci App key: the record and deploy jobs run in the caller's
+`production` environment (main-only branch policy) and read its environment secrets
+`TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` there. Recipe and inputs:
+[the guide](docs/reusable-workflows.md#deploy-to-coolify); setting up a new app:
+[Launch an internal site](https://wiki.verbanium.dev/docs/delivery/launch-an-internal-site).
 
 ## Releases (SemVer)
 

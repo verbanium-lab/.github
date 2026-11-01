@@ -2,7 +2,7 @@
 title: Reusable image builds and registry cleanup
 owner: verbanium
 status: draft
-last_reviewed: 2026-10-29
+last_reviewed: 2026-11-01
 ---
 
 # Reusable image builds and registry cleanup
@@ -570,6 +570,63 @@ jobs:
 
 When repository rulesets block bot pushes to the default branch, merge the automation PR or add a
 ruleset bypass for `github-actions[bot]` on the status commit message.
+
+## Deploy to Coolify
+
+`deploy-coolify.yml` deploys the main image of one app to its Coolify application (ADR 0009
+amendment 2026-10-28; .github#25). Its three jobs:
+
+| Job | Permissions | What it does |
+| --- | --- | --- |
+| `plan` | none | Validates every input against the run: main push, `image-tags` is `<image>:sha-<this commit>`, `sha7` is this commit, the digest, the Coolify UUID, https `verbanium.dev` URLs, the environment and the App client ID. Later jobs read only its outputs. |
+| `record` | none (App token) | Creates the GitHub Deployment with the verbanium-ci App in the caller's environment (`deployment: false`). |
+| `deploy` | `id-token: write` | Joins the tailnet as an ephemeral `tag:ci` node (Tailscale workload identity), sets `sha256-<hex>` as the Coolify image tag, deploys, waits up to 10 minutes for Coolify, then up to 5 minutes for `verify-url` to report `sha7`. Deploys of one app and environment queue (`cancel-in-progress: false`). |
+
+GitHub gives a reusable job that names an environment the caller repository's secrets of that
+environment, so `TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` must be environment
+secrets of `production` (main-only branch policy); the caller cannot pass them. The verbanium-ci
+App key is the one optional workflow secret: the wiki keeps it as an organization secret, so its
+caller passes `VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}`; an environment
+secret of the same name (Studio) takes precedence.
+
+| Input | Required | Meaning |
+| --- | --- | --- |
+| `app` | yes | App slug, used in the record, the summary and the concurrency group |
+| `image`, `digest`, `image-tags` | yes | Outputs `image`, `digest` and `tags` of `image.yml` (`push-mode: main`) |
+| `sha7` | yes | Short commit the live site must report |
+| `build-number` | no | Build number for the record; empty when the app has none |
+| `coolify-app-uuid` | yes | Coolify application UUID (a repository variable, e.g. `STUDIO_COOLIFY_APP_UUID`) |
+| `site-url` | yes | Environment URL shown on the deployment |
+| `verify-url` | yes | Fetched after the deploy until it reports `sha7` |
+| `verify-json-field` | no | JSON field of `verify-url` holding `sha7` (e.g. `sha` for `/healthz`); empty: the page text must contain `sha7` |
+| `environment` | no | `production` (default), `release-candidate` or `dev` |
+| `client-id` | yes | `${{ vars.VERBANIUM_CI_CLIENT_ID }}` |
+
+```yaml
+  deploy:
+    name: deploy (studio)
+    needs: [checks, image-main]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.checks.outputs.studio == 'true' }}
+    permissions:
+      id-token: write # Tailscale workload identity in the deploy job
+    uses: verbanium-lab/.github/.github/workflows/deploy-coolify.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      app: studio
+      image: ${{ needs.image-main.outputs.image }}
+      digest: ${{ needs.image-main.outputs.digest }}
+      image-tags: ${{ needs.image-main.outputs.tags }}
+      sha7: ${{ needs.checks.outputs.sha7 }}
+      coolify-app-uuid: ${{ vars.STUDIO_COOLIFY_APP_UUID }}
+      site-url: https://studio.verbanium.dev
+      verify-url: https://studio.verbanium.dev/healthz
+      verify-json-field: sha
+      client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+    secrets:
+      VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+```
+
+The wiki reports the build in the page footer, so it passes `verify-url: https://wiki.verbanium.dev/`
+and no `verify-json-field`.
 
 ## Verification and recovery
 

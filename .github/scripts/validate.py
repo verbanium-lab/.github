@@ -20,7 +20,7 @@ OWNED_FILES = {
     ".github/scripts/requirements.txt", ".github/tests/test_validate.py",
     ".github/workflows/image.yml", ".github/workflows/ghcr-cleanup.yml",
     ".github/workflows/deployed-tag.yml", ".github/workflows/release.yml",
-    ".github/workflows/release-notify.yml",
+    ".github/workflows/release-notify.yml", ".github/workflows/deploy-coolify.yml",
     ".github/workflows/status.yml",
     ".github/scripts/collect_status.py", ".github/scripts/render_status.py",
     ".github/tests/test_status.py",
@@ -228,6 +228,7 @@ def validate_reusable(workflow, kind):
         "deployed": {"docker/setup-buildx-action"},
         "release": {"actions/checkout"},
         "notify": set(),
+        "deploy": {"actions/create-github-app-token", "tailscale/github-action"},
         "status": {"actions/checkout", "actions/download-artifact"},
     }[kind]
     for job in jobs.values():
@@ -394,6 +395,59 @@ def validate_reusable(workflow, kind):
         require(telegram is not None and telegram["env"].get("TELEGRAM_RELEASES_BOT_TOKEN")
                 == "${{ secrets.TELEGRAM_RELEASES_BOT_TOKEN }}", "telegram token must use the optional workflow secret")
         require("gh release create" not in " ".join(s.get("run", "") for s in steps), "notify never creates releases")
+    elif kind == "deploy":
+        require(set(jobs) == {"plan", "record", "deploy"}, "plan, record and deploy jobs required")
+        secrets = call.get("secrets", {})
+        require(set(secrets) == {"VERBANIUM_CI_PRIVATE_KEY", "TS_OAUTH_CLIENT_ID", "TS_AUDIENCE", "COOLIFY_DEPLOY_TOKEN"}
+                and all(field.get("required") is False for field in secrets.values()),
+                "reviewed optional secrets only; deploy secrets come from the caller's environment")
+        declared = call.get("inputs", {})
+        required = {"app", "image", "digest", "image-tags", "sha7", "coolify-app-uuid", "site-url", "verify-url", "client-id"}
+        optional = {"build-number": "", "verify-json-field": "", "environment": "production"}
+        require(set(declared) == required | set(optional), "reviewed deploy inputs only")
+        for name in required:
+            field = declared[name]
+            require(field.get("type") == "string" and field.get("required") is True and "default" not in field,
+                    "required string inputs without defaults")
+        for name, default in optional.items():
+            field = declared[name]
+            require(field.get("type") == "string" and not field.get("required") and field.get("default") == default,
+                    "optional deploy inputs with reviewed defaults")
+        require(jobs["plan"].get("permissions") == {} and "needs" not in jobs["plan"] and "if" not in jobs["plan"]
+                and "environment" not in jobs["plan"], "plan runs first without permissions or secrets")
+        require(jobs["record"].get("permissions") == {} and jobs["record"].get("needs") == "plan",
+                "record uses only the App token")
+        require(jobs["record"].get("environment") == {"name": "${{ needs.plan.outputs.environment }}", "deployment": False},
+                "record runs in the caller environment without an Actions deployment")
+        require(jobs["deploy"].get("permissions") == {"id-token": "write"} and jobs["deploy"].get("needs") == ["plan", "record"],
+                "deploy permission boundary required")
+        require(jobs["deploy"].get("environment", {}).get("name") == "${{ needs.plan.outputs.environment }}",
+                "deploy runs in the caller environment")
+        require(jobs["deploy"].get("concurrency", {}).get("cancel-in-progress") is False, "deploys must queue, never cancel")
+        steps = jobs["plan"].get("steps", [])
+        require(len(steps) == 1 and steps[0].get("id") == "plan", "one validation step required")
+        expected = {"APP": "app", "IMAGE": "image", "DIGEST": "digest", "TAGS": "image-tags", "SHA7": "sha7",
+                    "BUILD_NUMBER": "build-number", "APP_UUID": "coolify-app-uuid", "SITE_URL": "site-url",
+                    "VERIFY_URL": "verify-url", "VERIFY_FIELD": "verify-json-field", "TARGET_ENV": "environment",
+                    "CLIENT_ID": "client-id"}
+        require(steps[0].get("env") == {k: "${{ inputs." + v + " }}" for k, v in expected.items()},
+                "validation must read every input through env")
+        plan_run = steps[0].get("run", "")
+        require('"$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main' in plan_run
+                and '"$TAGS" == "$IMAGE:sha-$GITHUB_SHA"' in plan_run and '"$SHA7" == "${GITHUB_SHA::7}"' in plan_run,
+                "the plan must bind the deploy to this main commit")
+        allowed_secrets = {"record": {"VERBANIUM_CI_PRIVATE_KEY"}, "deploy": {"TS_OAUTH_CLIENT_ID", "TS_AUDIENCE", "COOLIFY_DEPLOY_TOKEN"}}
+        for name, job in jobs.items():
+            text = repr(job)
+            if name != "plan":
+                require("inputs." not in text, "raw inputs may only enter the plan step through env")
+            used = set(re.findall(r"secrets\.([A-Z0-9_]+)", text))
+            require(used <= allowed_secrets.get(name, set()), "secrets only in the record and deploy jobs")
+        deploy_run = " ".join(s.get("run", "") for s in jobs["deploy"]["steps"])
+        require("COOLIFY_URL/api/v1/applications/$APP_UUID" in deploy_run and "api/v1/deploy?uuid=$APP_UUID" in deploy_run,
+                "Coolify API deploy required")
+        require(any(s.get("uses", "").startswith("tailscale/github-action@") and s.get("with", {}).get("tags") == "tag:ci"
+                    for s in jobs["deploy"]["steps"]), "ephemeral tag:ci tailnet node required")
     elif kind == "status":
         require(set(jobs) == {"status"}, "one status job required")
         require(not call.get("secrets"), "status workflow must not accept secrets")
@@ -457,6 +511,7 @@ def main():
         validate_reusable(load_yaml(root / ".github/workflows/deployed-tag.yml"), "deployed")
         validate_reusable(load_yaml(root / ".github/workflows/release.yml"), "release")
         validate_reusable(load_yaml(root / ".github/workflows/release-notify.yml"), "notify")
+        validate_reusable(load_yaml(root / ".github/workflows/deploy-coolify.yml"), "deploy")
         validate_reusable(load_yaml(root / ".github/workflows/status.yml"), "status")
         if args.snapshot:
             for path in paths:
