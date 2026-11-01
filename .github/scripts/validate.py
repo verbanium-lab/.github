@@ -397,7 +397,10 @@ def validate_reusable(workflow, kind):
         require("gh release create" not in " ".join(s.get("run", "") for s in steps), "notify never creates releases")
     elif kind == "deploy":
         require(set(jobs) == {"plan", "record", "deploy"}, "plan, record and deploy jobs required")
-        require(not call.get("secrets"), "deploy secrets come from the caller's environment, never from the caller")
+        secrets = call.get("secrets", {})
+        require(set(secrets) == {"VERBANIUM_CI_PRIVATE_KEY", "TS_OAUTH_CLIENT_ID", "TS_AUDIENCE", "COOLIFY_DEPLOY_TOKEN"}
+                and all(field.get("required") is False for field in secrets.values()),
+                "reviewed optional secrets only; deploy secrets come from the caller's environment")
         declared = call.get("inputs", {})
         required = {"app", "image", "digest", "image-tags", "sha7", "coolify-app-uuid", "site-url", "verify-url", "client-id"}
         optional = {"build-number": "", "verify-json-field": "", "environment": "production"}

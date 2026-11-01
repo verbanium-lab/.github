@@ -6,9 +6,11 @@
 #   deploy  joins the tailnet as an ephemeral tag:ci node (Tailscale workload identity, no stored
 #           key), sets the digest as the Coolify image tag, deploys, waits for Coolify, then waits
 #           until the live site reports this commit.
-# Secrets are never passed by the caller: the record and deploy jobs run in the caller's
-# environment (default `production`, main-only branch policy) and read its environment secrets
-# VERBANIUM_CI_PRIVATE_KEY, TS_OAUTH_CLIENT_ID, TS_AUDIENCE and COOLIFY_DEPLOY_TOKEN there.
+# The deploy secrets are never passed by the caller: the record and deploy jobs run in the
+# caller's environment (default `production`, main-only branch policy) and read its environment
+# secrets TS_OAUTH_CLIENT_ID, TS_AUDIENCE and COOLIFY_DEPLOY_TOKEN there. The verbanium-ci App key
+# is an organization secret in some repositories (wiki): the caller passes it as the one optional
+# secret; an environment secret of the same name takes precedence (GitHub's rule).
 # Callers keep this out of their required `ci` gate: a failed deploy must not block merging a fix.
 #
 # Caller example (after the shared image workflow):
@@ -30,6 +32,8 @@
 #       verify-url: https://studio.verbanium.dev/healthz
 #       verify-json-field: sha
 #       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+#     secrets:
+#       VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
 
 name: Deploy to Coolify
 
@@ -87,6 +91,22 @@ on:
         description: Client ID of the verbanium-ci GitHub App
         required: true
         type: string
+    # All optional and normally not passed: the jobs below run in the caller's environment, whose
+    # secrets of the same names take precedence. Only the App key may come from the caller, where it
+    # is an organization secret (wiki). Declared so that the names are reviewed (actionlint).
+    secrets:
+      VERBANIUM_CI_PRIVATE_KEY:
+        description: verbanium-ci App key; an environment secret of the same name takes precedence
+        required: false
+      TS_OAUTH_CLIENT_ID:
+        description: Environment secret of the caller; do not pass
+        required: false
+      TS_AUDIENCE:
+        description: Environment secret of the caller; do not pass
+        required: false
+      COOLIFY_DEPLOY_TOKEN:
+        description: Environment secret of the caller; do not pass
+        required: false
 
 permissions: {}
 
@@ -158,8 +178,8 @@ jobs:
             echo "client-id=$CLIENT_ID"
           } >> "$GITHUB_OUTPUT"
 
-  # The GitHub Deployment record, created by the verbanium-ci App (ADR 0009). The App key is an
-  # environment secret of the caller (main-only); this record is the only deployment it creates.
+  # The GitHub Deployment record, created by the verbanium-ci App (ADR 0009). The App key comes
+  # from the caller's environment or, failing that, the caller; this is the only record it creates.
   record:
     name: deployment record
     needs: plan

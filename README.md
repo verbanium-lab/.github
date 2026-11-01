@@ -98,9 +98,9 @@ See [the guide](docs/reusable-workflows.md#protect-the-deployed-digest).
 `deploy-coolify.yml` replaces the deploy jobs copied between repositories (wiki, Studio). Pin it by
 a reviewed full commit SHA and call it after `image.yml` on main pushes; keep it out of the required
 `ci` job, so a failed deploy never blocks merging a fix. The caller grants only `id-token: write`
-and passes no secrets: the record and deploy jobs run in the caller's `production` environment
-(main-only branch policy) and read its environment secrets `VERBANIUM_CI_PRIVATE_KEY`,
-`TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN`. Recipe and inputs:
+and passes at most the verbanium-ci App key: the record and deploy jobs run in the caller's
+`production` environment (main-only branch policy) and read its environment secrets
+`TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` there. Recipe and inputs:
 [the guide](docs/reusable-workflows.md#deploy-to-coolify); setting up a new app:
 [Launch an internal site](https://wiki.verbanium.dev/docs/delivery/launch-an-internal-site).
 

@@ -582,10 +582,12 @@ amendment 2026-10-28; .github#25). Its three jobs:
 | `record` | none (App token) | Creates the GitHub Deployment with the verbanium-ci App in the caller's environment (`deployment: false`). |
 | `deploy` | `id-token: write` | Joins the tailnet as an ephemeral `tag:ci` node (Tailscale workload identity), sets `sha256-<hex>` as the Coolify image tag, deploys, waits up to 10 minutes for Coolify, then up to 5 minutes for `verify-url` to report `sha7`. Deploys of one app and environment queue (`cancel-in-progress: false`). |
 
-The caller passes no secrets. GitHub gives a reusable job that names an environment the caller
-repository's secrets of that environment, so `VERBANIUM_CI_PRIVATE_KEY`, `TS_OAUTH_CLIENT_ID`,
-`TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` must be environment secrets of `production` (main-only
-branch policy), not repository or organization secrets.
+GitHub gives a reusable job that names an environment the caller repository's secrets of that
+environment, so `TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` must be environment
+secrets of `production` (main-only branch policy); the caller cannot pass them. The verbanium-ci
+App key is the one optional workflow secret: the wiki keeps it as an organization secret, so its
+caller passes `VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}`; an environment
+secret of the same name (Studio) takes precedence.
 
 | Input | Required | Meaning |
 | --- | --- | --- |
@@ -619,6 +621,8 @@ branch policy), not repository or organization secrets.
       verify-url: https://studio.verbanium.dev/healthz
       verify-json-field: sha
       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+    secrets:
+      VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
 ```
 
 The wiki reports the build in the page footer, so it passes `verify-url: https://wiki.verbanium.dev/`
