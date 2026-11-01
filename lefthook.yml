@@ -1,0 +1,23 @@
+# Local Git hooks. Install once per clone: README.md (Git hooks).
+# One-shot disable: LEFTHOOK=0 or git commit|push --no-verify. CI remains the gate.
+
+pre-commit:
+  parallel: true
+  commands:
+    shellcheck:
+      glob: "*.{sh,bash}"
+      run: bash .github/scripts/hooks/staged.sh shellcheck -- {staged_files}
+    actionlint:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: bash .github/scripts/hooks/staged.sh actionlint -- {staged_files}
+    python:
+      glob: "*.py"
+      run: python3 -B -m py_compile {staged_files}
+    json:
+      glob: "*.json"
+      run: for f in {staged_files}; do python3 -I -m json.tool "$f" >/dev/null || exit 1; done
+
+pre-push:
+  commands:
+    check:
+      run: bash .github/scripts/hooks/pre-push.sh .github/scripts/check.sh python gitleaks actionlint zizmor

@@ -58,6 +58,13 @@ validated tracked files plus this repository's Git history, with findings fully 
 not honor inline suppression comments or walk other checkouts or local dependency stores. Secret detection is heuristic; a green scan
 does not establish that arbitrary private text is safe to publish.
 
+### Git hooks (optional)
+
+`lefthook.yml` runs ShellCheck, actionlint and Python/JSON syntax on staged files, and on push gitleaks
+on `origin/main..HEAD` plus `.github/scripts/check.sh` (skipped with a notice when `python`, gitleaks,
+actionlint or zizmor is not on `PATH`, e.g. outside the virtual environment above). Install once per clone
+with `lefthook install` (`brew install lefthook`). CI remains the gate; `LEFTHOOK=0` disables the hooks once.
+
 ## Verified tool inputs
 
 Pins were checked against vendor release metadata on 2026-10-24. The installer verifies the vendor
