@@ -652,12 +652,17 @@ image bytes require rebuilding or restoring from another registry and cannot be 
 (owner decision 2026-11-01: the Release PR is a technical registration of a release; code is
 reviewed in the feature PRs, so the Release PR must not wait for a manual approval).
 
-Call it from the caller's `release.yml` after the release-please job, pinned by commit:
+Each caller has two callers of it, both pinned by the same reviewed commit. The first runs on the
+push to `main` that creates or updates the Release PR (its `ci` check is usually still running then);
+the second runs when the caller's `CI` workflow finishes on the Release PR branch and does the merge.
+
+`release.yml`, after the release-please job:
 
 ```yaml
   release-pr-merge:
     needs: release-please
-    permissions: {}
+    permissions:
+      checks: read
     uses: verbanium-lab/.github/.github/workflows/release-pr-merge.yml@REVIEWED_WORKFLOW_COMMIT
     secrets:
       VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
@@ -665,18 +670,54 @@ Call it from the caller's `release.yml` after the release-please job, pinned by 
       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
 ```
 
-It enables GitHub auto-merge (`--squash --match-head-commit <checked sha>`) only when all hold:
+`release-pr-merge.yml` (new file in the caller):
 
-- the run is a push to `main`; the job runs in the caller's `production` environment;
+```yaml
+name: Release PR merge
+
+on:
+  # Runs from the default branch (main) after CI completes on the Release PR branch; it executes no
+  # code from that branch and re-checks the PR through the API before merging.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [CI]
+    types: [completed]
+    branches: [release-please--branches--main]
+
+permissions: {}
+
+jobs:
+  release-pr-merge:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository }}
+    permissions:
+      checks: read
+    uses: verbanium-lab/.github/.github/workflows/release-pr-merge.yml@REVIEWED_WORKFLOW_COMMIT
+    secrets:
+      VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+    with:
+      client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+```
+
+It merges the PR (squash, through the REST merge endpoint with `sha=<checked head>`) only when all
+hold:
+
+- the run is a push to `main` or a `workflow_run` (which GitHub runs on `main`); the job runs in the
+  caller's `production` environment;
 - exactly one open PR from `release-please--branches--main` in the same repository into `main`,
   not a draft, authored by `verbanium-ci[bot]`;
 - every changed file is release metadata — `.release-please-manifest.json`, `CHANGELOG.md`,
   `package.json`, `package-lock.json`, `version.txt` — and in the JSON/text files every changed line
-  is a version (`"version": "…"`, a manifest `"<path>": "<semver>"` entry, or a bare semver).
+  is a version (`"version": "…"`, a manifest `"<path>": "<semver>"` entry, or a bare semver);
+- the required `ci` check run from GitHub Actions on exactly that head SHA is completed with
+  `success` (read with the job token, `checks: read`; the App token is used only for the merge).
+  While `ci` is still running it exits quietly; the `workflow_run` caller retries when CI ends.
 
-Otherwise it writes a warning to the run summary and leaves the PR for the owner. GitHub merges
-only after the required checks of the `ci-required` org ruleset pass on that exact head; that
-ruleset has no bypass actors. The `main` org ruleset lists the verbanium-ci App as a bypass actor
+GitHub auto-merge is not used: it does not apply the App's ruleset bypass, so a Release PR with
+auto-merge on stays `BLOCKED` waiting for an approval (verbanium-templates#79). A direct merge by
+the bypass actor is what the `main` ruleset allows.
+
+Otherwise it writes a warning to the run summary and leaves the PR for the owner. GitHub still
+refuses the merge unless the required checks of the `ci-required` org ruleset pass on that exact
+head; that ruleset has no bypass actors. The `main` org ruleset lists the verbanium-ci App as a bypass actor
 in `pull_request` mode (infra `github/repositories.json`), which lets the App merge a PR without
 the owner's approval. It does not skip required checks, and it does not allow direct pushes.
 

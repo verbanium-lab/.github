@@ -327,11 +327,17 @@ class DefaultsTests(unittest.TestCase):
         for mutate in (
             lambda w: w.update(on={'pull_request_target': None}),
             lambda w: w['jobs']['merge'].update(permissions={'contents': 'write'}),
+            lambda w: w['jobs']['merge'].update(permissions={'checks': 'read', 'contents': 'write'}),
+            lambda w: w['jobs']['merge']['steps'][-1]['env'].update(CHECKS_TOKEN='${{ steps.app.outputs.token }}'),
+            lambda w: w['jobs']['merge']['steps'][-1].update(run=w['jobs']['merge']['steps'][-1]['run'] + ' --auto'),
             lambda w: w['jobs']['merge'].pop('environment'),
             lambda w: w[True]['workflow_call']['secrets'].update(EXTRA={'required': False}),
             lambda w: w['jobs']['merge']['steps'][1]['with'].update({'permission-administration': 'write'}),
             lambda w: w['jobs']['merge']['steps'][0].update(env={'CLIENT_ID': 'x'}),
-            strip('"--match-head-commit"'), strip('"--auto"'), strip('verbanium-ci[bot]'),
+            lambda w: w['jobs']['merge']['steps'][0].update(
+                run=w['jobs']['merge']['steps'][0]['run'].replace('workflow_run', 'pull_request_target')),
+            strip('f"sha={sha}"'), strip('"merge_method=squash"'), strip('ACTIONS_APP_ID = 15368'),
+            strip('"conclusion") != "success"'), strip('verbanium-ci[bot]'),
             strip('release-please--branches--main'), strip('VERSION_LINE'),
         ):
             workflow = self.reusable('merge')

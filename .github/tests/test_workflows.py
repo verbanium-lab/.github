@@ -52,18 +52,23 @@ RELEASE = embedded_python('.github/workflows/release.yml', 'Validate inputs and 
 NOTIFY = embedded_python('.github/workflows/release-notify.yml', 'Validate tags and event boundary')
 RETENTION = embedded_python('.github/workflows/ghcr-cleanup.yml', 'Protect the latest ten sha tags')
 AFFECTED = embedded_python('docs/reusable-workflows.md', 'Select affected images')
-RELEASE_PR = embedded_python('.github/workflows/release-pr-merge.yml', 'Check the Release PR and enable auto-merge')
+RELEASE_PR = embedded_python('.github/workflows/release-pr-merge.yml', 'Check the Release PR and merge it')
 
 FAKE_GH = '''#!/usr/bin/env python3
 import json, os, sys
 d = os.environ["FAKE_DIR"]
 args = sys.argv[1:]
-if args[:1] == ["api"]:
+if args[:3] == ["api", "--method", "PUT"]:
+    open(os.path.join(d, "merge.log"), "a").write(os.environ["GH_TOKEN"] + " " + " ".join(args) + "\\n")
+    sys.exit(int(open(os.path.join(d, "merge_exit")).read()) if os.path.exists(os.path.join(d, "merge_exit")) else 0)
+elif args[:1] == ["api"]:
     path = args[-1]
-    name = "files" if "/files" in path else "pulls"
-    print(json.dumps([json.load(open(os.path.join(d, name + ".json")))]))
-elif args[:2] == ["pr", "merge"]:
-    open(os.path.join(d, "merge.log"), "a").write(" ".join(args) + "\\n")
+    if "/check-runs" in path:
+        open(os.path.join(d, "checks.log"), "a").write(os.environ["GH_TOKEN"] + " " + path + "\\n")
+        print(json.dumps([{"check_runs": json.load(open(os.path.join(d, "checks.json")))}]))
+    else:
+        name = "files" if "/files" in path else "pulls"
+        print(json.dumps([json.load(open(os.path.join(d, name + ".json")))]))
 else:
     sys.exit(2)
 '''
@@ -77,6 +82,16 @@ GOOD_FILES = [
     dict(filename='portal/package-lock.json', status='modified',
          patch='@@\n-  "version": "1.7.1",\n+  "version": "1.7.2",\n-      "version": "1.7.1",\n+      "version": "1.7.2",'),
 ]
+
+
+def ci_run(**changes):
+    run = dict(id=1, name='ci', status='completed', conclusion='success', completed_at='2026-11-02T04:35:00Z',
+               app=dict(id=15368))
+    run.update(changes)
+    return run
+
+
+GREEN = [ci_run()]
 
 
 def release_pr(**changes):
@@ -318,23 +333,48 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(values, {})
 
-    def release_merge(self, pulls, files):
+    def release_merge(self, pulls, files, checks=GREEN, merge_exit=0, with_checks_log=False):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             (d / 'gh').write_text(FAKE_GH)
             (d / 'gh').chmod(0o755)
             (d / 'pulls.json').write_text(json.dumps(pulls))
             (d / 'files.json').write_text(json.dumps(files))
+            (d / 'checks.json').write_text(json.dumps(checks))
+            if merge_exit:
+                (d / 'merge_exit').write_text(str(merge_exit))
             env = dict(PATH=f"{d}:{os.environ['PATH']}", FAKE_DIR=str(d), GITHUB_REPOSITORY='verbanium-lab/wiki',
-                       GITHUB_REPOSITORY_OWNER='verbanium-lab', GITHUB_STEP_SUMMARY=str(d / 'summary'))
+                       GITHUB_REPOSITORY_OWNER='verbanium-lab', GITHUB_STEP_SUMMARY=str(d / 'summary'),
+                       GH_TOKEN='app-token', CHECKS_TOKEN='job-token')
             result = subprocess.run([sys.executable, '-c', RELEASE_PR], env=env, capture_output=True, text=True)
             log = (d / 'merge.log').read_text() if (d / 'merge.log').exists() else ''
-            return result, log
+            checks_log = (d / 'checks.log').read_text() if (d / 'checks.log').exists() else ''
+            return (result, log, checks_log) if with_checks_log else (result, log)
 
-    def test_release_pr_metadata_only_is_auto_merged_at_the_checked_head(self):
-        result, log = self.release_merge([release_pr()], GOOD_FILES)
+    def test_release_pr_metadata_only_is_merged_directly_at_the_checked_head(self):
+        result, log, checks_log = self.release_merge([release_pr()], GOOD_FILES, with_checks_log=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('pr merge 167 --repo verbanium-lab/wiki --squash --auto --match-head-commit ' + 'b' * 40, log)
+        self.assertEqual(log.strip(), 'app-token api --method PUT repos/verbanium-lab/wiki/pulls/167/merge '
+                         '-f merge_method=squash -f sha=' + 'b' * 40)
+        # Checks are read with the job token at exactly the PR head; the App token only merges.
+        self.assertEqual(checks_log.strip(),
+                         'job-token repos/verbanium-lab/wiki/commits/' + 'b' * 40 + '/check-runs?check_name=ci&per_page=100')
+
+    def test_release_pr_waits_until_ci_passes_on_the_head(self):
+        for checks in ([], [ci_run(status='in_progress', conclusion=None)],
+                       [ci_run(), ci_run(id=2, status='queued', conclusion=None)],
+                       [ci_run(conclusion='failure')], [ci_run(conclusion='cancelled')],
+                       [ci_run(app=dict(id=99))], [ci_run(name='checks')],
+                       [ci_run(), ci_run(id=2, conclusion='failure', completed_at='2026-11-02T05:00:00Z')]):
+            with self.subTest(checks=checks):
+                result, log = self.release_merge([release_pr()], GOOD_FILES, checks=checks)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log, '')
+
+    def test_release_pr_merge_refusal_fails_the_job(self):
+        result, log = self.release_merge([release_pr()], GOOD_FILES, merge_exit=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('pulls/167/merge', log)
 
     def test_release_pr_absent_or_ambiguous_is_left_alone(self):
         for pulls in ([], [release_pr(), release_pr(number=168)]):
