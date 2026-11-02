@@ -465,25 +465,30 @@ def validate_reusable(workflow, kind):
         require(set(declared) == {"client-id"} and declared["client-id"].get("type") == "string"
                 and declared["client-id"].get("required") is True, "client-id input only")
         job = jobs["merge"]
-        require(job.get("permissions") == {} and "needs" not in job and "if" not in job,
-                "merge uses only the App token and always runs")
+        require(job.get("permissions") == {"checks": "read"} and "needs" not in job and "if" not in job,
+                "merge job token reads checks only (the merge uses the App token) and always runs")
         require(job.get("environment") == {"name": "production", "deployment": False},
                 "the App key stays behind the production environment")
         steps = job.get("steps", [])
         require(steps and steps[0].get("id") == "plan" and steps[0].get("env") == {"CLIENT_ID": "${{ inputs.client-id }}"},
                 "validation must run first and read client-id through env")
-        require('"$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main' in steps[0].get("run", ""),
-                "main pushes only")
+        require('("$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_run) && "$GITHUB_REF" == refs/heads/main'
+                in steps[0].get("run", ""), "main pushes or CI workflow_run on main only")
         for step in steps[1:]:
             require("inputs." not in repr(step), "raw inputs may only enter the validation step through env")
         token = next((s for s in steps if s.get("uses", "").startswith("actions/create-github-app-token@")), None)
         require(token is not None and set(token.get("with", {})) == {"client-id", "private-key", "permission-contents",
                 "permission-pull-requests"}, "App token scoped to contents and pull requests")
         run = " ".join(s.get("run", "") for s in steps)
-        for needle in ("release-please--branches--main", "verbanium-ci[bot]", '"--auto"', '"--match-head-commit"',
-                       '"--squash"', "MANIFEST_LINE", "VERSION_LINE"):
+        for needle in ("release-please--branches--main", "verbanium-ci[bot]", '"merge_method=squash"', 'f"sha={sha}"',
+                       'REQUIRED_CHECK = "ci"', "ACTIONS_APP_ID = 15368", '"conclusion") != "success"',
+                       "MANIFEST_LINE", "VERSION_LINE"):
             require(needle in run, "release PR guard required: " + needle)
-        require("gh pr review" not in run and "--admin" not in run, "no approvals or admin merges")
+        require("gh pr review" not in run and "--admin" not in run and "--auto" not in run,
+                "no approvals, admin merges or auto-merge (auto-merge does not apply the ruleset bypass)")
+        merge_step = steps[-1]
+        require(merge_step.get("env") == {"GH_TOKEN": "${{ steps.app.outputs.token }}", "CHECKS_TOKEN": "${{ github.token }}"},
+                "App token for the merge, job token only for reading checks")
     elif kind == "status":
         require(set(jobs) == {"status"}, "one status job required")
         require(not call.get("secrets"), "status workflow must not accept secrets")

@@ -1,28 +1,36 @@
-# Merges the caller repository's open release-please Release PR once its required checks pass
-# (owner decision 2026-11-01: the Release PR is a technical registration of a release; the owner
-# reviews code in the feature PRs, so the Release PR must not block releases).
+# Merges the caller repository's open release-please Release PR once its required `ci` check has
+# passed on the PR head (owner decision 2026-11-01: the Release PR is a technical registration of a
+# release; the owner reviews code in the feature PRs, so the Release PR must not block releases).
 #
 # Safety boundary — the PR is merged only when ALL hold, otherwise it is left for the owner:
-#   - event is a push to main of the caller repository;
+#   - event is a push to main, or a workflow_run of the caller's CI (which GitHub runs on main);
 #   - head branch `release-please--branches--main` in the same repository, base `main`, not draft;
 #   - author is the verbanium-ci App (`verbanium-ci[bot]`);
 #   - every changed file is release metadata: `.release-please-manifest.json`, `CHANGELOG.md`,
 #     `package.json`, `package-lock.json`, `version.txt`; in the JSON files every changed line is a
-#     `"version"` field (manifest: a `"<path>": "<semver>"` entry). Anything else → skip.
-# The merge is GitHub auto-merge (`--squash --match-head-commit`): GitHub merges only after the
-# required checks (org ruleset `ci-required`, which has no bypass) pass on exactly the checked head.
-# The org ruleset `main` lets the verbanium-ci App bypass the approval rule for PR merges only
-# (infra github/repositories.json). Nothing else gets merged by this workflow.
+#     `"version"` field (manifest: a `"<path>": "<semver>"` entry). Anything else → skip;
+#   - the required `ci` check run from GitHub Actions (app 15368) on exactly that head SHA is
+#     completed with success (read with the job token, `checks: read`). Pending → wait for the CI
+#     workflow_run trigger; failed → skip.
+# The merge is a direct squash merge by the verbanium-ci App through the REST merge endpoint with
+# `sha=<checked head>`. GitHub auto-merge is not used: it does not apply the App's ruleset bypass
+# (verbanium-templates#79 stayed BLOCKED with auto-merge on). The org ruleset `main` lets the
+# verbanium-ci App bypass the approval rule for PR merges only (infra github/repositories.json);
+# the `ci-required` ruleset has no bypass, so GitHub still refuses a merge without a green `ci`.
 #
-# Caller example (release.yml, after the release-please job):
-#   release-pr-merge:
-#     needs: release-please
-#     permissions: {}
-#     uses: verbanium-lab/.github/.github/workflows/release-pr-merge.yml@REVIEWED_WORKFLOW_COMMIT
-#     secrets:
-#       VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
-#     with:
-#       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+# Callers (both pinned by commit):
+#   release.yml, after the release-please job (runs on the push to main that updates the PR):
+#     release-pr-merge:
+#       needs: release-please
+#       permissions:
+#         checks: read
+#       uses: verbanium-lab/.github/.github/workflows/release-pr-merge.yml@REVIEWED_WORKFLOW_COMMIT
+#       secrets:
+#         VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+#       with:
+#         client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+#   release-pr-merge.yml, triggered when CI finishes on the Release PR branch — see
+#   docs/reusable-workflows.md#release-pr-merge.
 
 name: Release PR merge
 
@@ -48,7 +56,9 @@ jobs:
   merge:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    permissions: {}
+    # Only to read the `ci` check runs of the Release PR head; the merge uses the App token.
+    permissions:
+      checks: read
     # The verbanium-ci key is used on main only, behind the production environment's branch rule.
     environment:
       name: production
@@ -59,8 +69,8 @@ jobs:
         env:
           CLIENT_ID: ${{ inputs.client-id }}
         run: |
-          [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]] \
-            || { echo "::error::release PR merge runs on pushes to main only"; exit 1; }
+          [[ ("$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_run) && "$GITHUB_REF" == refs/heads/main ]] \
+            || { echo "::error::release PR merge runs on pushes to main or CI workflow_run only"; exit 1; }
           [[ "$CLIENT_ID" =~ ^Iv[0-9A-Za-z.]{10,40}$ ]] || { echo "::error::invalid client-id"; exit 1; }
           echo "client-id=$CLIENT_ID" >> "$GITHUB_OUTPUT"
       - name: Mint verbanium-ci token
@@ -71,9 +81,10 @@ jobs:
           private-key: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
-      - name: Check the Release PR and enable auto-merge
+      - name: Check the Release PR and merge it
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          CHECKS_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
           import json, os, re, subprocess, sys
@@ -83,16 +94,21 @@ jobs:
           summary = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
           HEAD = "release-please--branches--main"
           AUTHOR = "verbanium-ci[bot]"
+          REQUIRED_CHECK = "ci"
+          ACTIONS_APP_ID = 15368  # GitHub Actions; the integration the ci-required ruleset trusts
           META = re.compile(r"^(?:.+/)?(?:CHANGELOG\.md|package\.json|package-lock\.json|version\.txt)$|^\.release-please-manifest\.json$")
           VERSION_LINE = re.compile(r'^[+-]\s*"version":\s*"[0-9A-Za-z.+-]+",?\s*$')
           MANIFEST_LINE = re.compile(r'^[+-]\s*"[A-Za-z0-9._/-]+":\s*"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?",?\s*$')
           TEXT_LINE = re.compile(r"^[+-]\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\s*$")
 
-          def api(path):
+          def pages(path, token=None):
+              env = dict(os.environ, GH_TOKEN=token) if token else None
               out = subprocess.run(["gh", "api", "--paginate", "--slurp", path],
-                                   capture_output=True, text=True, check=True).stdout
-              pages = json.loads(out)
-              return [item for page in pages for item in page]
+                                   capture_output=True, text=True, check=True, env=env).stdout
+              return json.loads(out)
+
+          def api(path):
+              return [item for page in pages(path) for item in page]
 
           def say(message):
               print(message)
@@ -107,6 +123,9 @@ jobs:
               sys.exit(0)
           pr = prs[0]
           number, sha = pr["number"], pr["head"]["sha"]
+          if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+              say(f"::warning::Release PR #{number}: unexpected head SHA — left for the owner.")
+              sys.exit(0)
           reasons = []
           if pr["user"]["login"] != AUTHOR or pr["user"]["type"] != "Bot":
               reasons.append(f"author {pr['user']['login']} is not {AUTHOR}")
@@ -134,7 +153,25 @@ jobs:
           if reasons:
               say(f"::warning::Release PR #{number} left for the owner: " + "; ".join(reasons))
               sys.exit(0)
-          subprocess.run(["gh", "pr", "merge", str(number), "--repo", repo, "--squash", "--auto",
-                          "--match-head-commit", sha], check=True)
-          say(f"Release PR #{number} ({sha[:7]}): auto-merge enabled; GitHub merges it when the required checks pass.")
+
+          runs = [run for page in pages(f"repos/{repo}/commits/{sha}/check-runs?check_name={REQUIRED_CHECK}&per_page=100",
+                                      os.environ["CHECKS_TOKEN"])
+                  for run in page.get("check_runs", [])
+                  if run.get("name") == REQUIRED_CHECK and (run.get("app") or {}).get("id") == ACTIONS_APP_ID]
+          if not runs or any(run.get("status") != "completed" for run in runs):
+              say(f"Release PR #{number} ({sha[:7]}): required check `{REQUIRED_CHECK}` not finished — "
+                  "the CI workflow_run trigger merges it when CI completes.")
+              sys.exit(0)
+          latest = max(runs, key=lambda run: (run.get("completed_at") or "", run.get("id") or 0))
+          if latest.get("conclusion") != "success":
+              say(f"::warning::Release PR #{number} ({sha[:7]}): `{REQUIRED_CHECK}` is {latest.get('conclusion')} — left for the owner.")
+              sys.exit(0)
+
+          merged = subprocess.run(["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
+                                   "-f", "merge_method=squash", "-f", f"sha={sha}"],
+                                  capture_output=True, text=True)
+          if merged.returncode != 0:
+              say(f"::error::Release PR #{number} ({sha[:7]}) merge refused: {merged.stderr.strip() or merged.stdout.strip()}")
+              sys.exit(1)
+          say(f"Release PR #{number} ({sha[:7]}): merged (squash) after `{REQUIRED_CHECK}` passed on that head.")
           PY
