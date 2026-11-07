@@ -27,6 +27,18 @@ MINIMUM_PROTECTED_PATTERNS: tuple[str, ...] = (
     "pnpm-workspace.yaml",
     "Dockerfile*",
     "**/Dockerfile*",
+    "**/package.json",
+    "Justfile",
+    ".justfile",
+    ".npmrc",
+    "**/.npmrc",
+    ".dockerignore",
+    "**/.dockerignore",
+    "docker-compose*",
+    "**/docker-compose*",
+    "turbo.json",
+    "**/.env*",
+    ".env*",
 )
 
 

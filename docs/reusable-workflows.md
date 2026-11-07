@@ -773,6 +773,20 @@ Configure the caller ruleset so this gate job's check name (for example `Risk lo
 required. The gate still requires both `required-check` (default `ci`) and `ai-review-check` (default
 `ai-review`) to be green on the pinned head before enabling auto-merge.
 
+### Trust model: what the gate does not prove
+
+- **`risk:low` is the agent's own assessment.** The gate does not check who set the label. A repository
+  that uses the gate must keep the human-owned controls: a ruleset that requires the gate check and, for
+  anything the owner wants to review, an approving review from a human; bypass actors of the ruleset belong
+  to humans only.
+- **Check names can be forged by anything that runs PR code with `checks: write`.** CI jobs that execute
+  PR code must not have `checks: write`; set `ai-review-app-id` to the real app that publishes the
+  reviewer check (do not leave it on the GitHub Actions default once the reviewer is its own app).
+- **Auto-merge stays enabled after a push until the gate runs again.** `--match-head-commit` pins the
+  moment of enabling only. Keep the gate as a required check in the ruleset so a merge cannot complete
+  before it has run on the new head, and use the `concurrency` group in the caller example so older runs
+  never enable auto-merge after a later run disabled it.
+
 ### App token permissions (auto-merge)
 
 The workflow mints a verbanium-ci installation token with `permission-contents: read` and
@@ -814,6 +828,10 @@ requested with the App token.
 
 ```yaml
 name: Risk low auto-merge
+
+concurrency:
+  group: risk-low-automerge-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: false
 
 on:
   pull_request_target: # zizmor: ignore[dangerous-triggers]
