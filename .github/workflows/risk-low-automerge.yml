@@ -5,9 +5,9 @@
 # Head SHA is pinned for gh pr merge --match-head-commit. A new push to the PR requires a fresh
 # gate run before auto-merge applies to that commit.
 #
-# Callers pin this file by reviewed commit and pass every policy knob through inputs (no embedded
-# reviewer or model names). The AI review check name is an input (default ai-review); the check
-# itself is produced elsewhere (engine-apps#26).
+# Callers pin this workflow by reviewed commit and pass gate-ref (verbanium-lab/.github script SHA)
+# plus every policy knob through inputs. The AI review check name is an input (default ai-review);
+# the check itself is produced elsewhere (engine-apps#26).
 #
 # Example caller — see docs/reusable-workflows.md#risk-low-auto-merge.
 
@@ -18,6 +18,12 @@ on:
     inputs:
       client-id:
         description: verbanium-ci App client ID (vars.VERBANIUM_CI_CLIENT_ID of the caller)
+        required: true
+        type: string
+      gate-ref:
+        description: >-
+          40-character lowercase hex commit of verbanium-lab/.github that supplies
+          risk_low_automerge.py (callers pin; bump when the gate script changes on main)
         required: true
         type: string
       pr-number:
@@ -41,12 +47,10 @@ on:
         default: risk:high
         type: string
       protected-paths:
-        description: Newline-separated globs; any changed file that matches blocks auto-merge
-        default: |
-          .github/workflows/**
-          .github/CODEOWNERS
-          **/.sops.yaml
-          **/secrets/**
+        description: >-
+          Newline-separated extra globs merged with the gate script minimum set; callers cannot
+          remove baked-in protected paths
+        default: ""
         type: string
       allowed-authors:
         description: Comma-separated login|Type pairs allowed besides the configured agent bot id
@@ -94,6 +98,7 @@ jobs:
         id: plan
         env:
           CLIENT_ID: ${{ inputs.client-id }}
+          GATE_REF: ${{ inputs.gate-ref }}
           PR_NUMBER: ${{ inputs.pr-number }}
           REQUIRED_CHECK: ${{ inputs.required-check }}
           AI_REVIEW_CHECK: ${{ inputs.ai-review-check }}
@@ -107,12 +112,18 @@ jobs:
           BASE_BRANCH: ${{ inputs.base-branch }}
         run: |
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::pr-number must be digits"; exit 1; }
+          [[ "$GATE_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::gate-ref must be a 40-character lowercase hex commit of verbanium-lab/.github"; exit 1; }
           [[ "$CLIENT_ID" =~ ^Iv[0-9A-Za-z.]{10,40}$ ]] || { echo "::error::invalid client-id"; exit 1; }
           [[ "$AGENT_BOT_ID" == "" || "$AGENT_BOT_ID" =~ ^[0-9]+$ ]] || { echo "::error::agent-bot-id must be digits or empty"; exit 1; }
           [[ "$ACTIONS_APP_ID" =~ ^[0-9]+$ ]] || { echo "::error::actions-app-id must be digits"; exit 1; }
           [[ "$AI_REVIEW_ACTIONS_APP_ID" =~ ^[0-9]+$ ]] || { echo "::error::ai-review-actions-app-id must be digits"; exit 1; }
+          for line in client-id="$CLIENT_ID" gate-ref="$GATE_REF" pr-number="$PR_NUMBER" required-check="$REQUIRED_CHECK" ai-review-check="$AI_REVIEW_CHECK" low-risk-label="$LOW_RISK_LABEL" high-risk-label="$HIGH_RISK_LABEL" agent-bot-id="$AGENT_BOT_ID" actions-app-id="$ACTIONS_APP_ID" ai-review-actions-app-id="$AI_REVIEW_ACTIONS_APP_ID" base-branch="$BASE_BRANCH"; do
+            val="${line#*=}"
+            [[ "$val" != *$'\n'* && "$val" != *$'\r'* ]] || { echo "::error::workflow output value must not contain newlines: ${line%%=*}"; exit 1; }
+          done
           {
             echo "client-id=$CLIENT_ID"
+            echo "gate-ref=$GATE_REF"
             echo "pr-number=$PR_NUMBER"
             echo "required-check=$REQUIRED_CHECK"
             echo "ai-review-check=$AI_REVIEW_CHECK"
@@ -133,7 +144,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: verbanium-lab/.github
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ steps.plan.outputs.gate-ref }}
           path: _github-defaults
           persist-credentials: false
           sparse-checkout: .github/scripts/risk_low_automerge.py
@@ -166,8 +177,9 @@ jobs:
           import json, os, subprocess, sys
 
           sys.path.insert(0, "_github-defaults/.github/scripts")
-          from risk_low_automerge import decide, parse_agent_bot_id, parse_allowed_authors, parse_patterns
-          from risk_low_automerge import paths_from_pr_files, pr_files_inventory_ok
+          from risk_low_automerge import decide, neutralize_actions_log_text, parse_agent_bot_id
+          from risk_low_automerge import parse_allowed_authors, parse_patterns, paths_from_pr_files
+          from risk_low_automerge import pr_files_inventory_ok
 
           repo = os.environ["REPO"]
           number = os.environ["PR_NUMBER"]
@@ -240,10 +252,10 @@ jobs:
               actions_app_id=int(os.environ["ACTIONS_APP_ID"]),
               ai_review_actions_app_id=int(os.environ["AI_REVIEW_ACTIONS_APP_ID"]),
           )
+          safe_reasons = "; ".join(neutralize_actions_log_text(r) for r in decision.reasons)
           if not decision.enable_auto_merge:
               say(
-                  f"::notice::PR #{number} ({sha[:7]}): auto-merge not enabled — "
-                  + "; ".join(decision.reasons)
+                  f"::notice::PR #{number} ({sha[:7]}): auto-merge not enabled — " + safe_reasons
               )
               disabled = subprocess.run(
                   ["gh", "pr", "merge", number, "--disable-auto", "--repo", repo],
@@ -255,10 +267,11 @@ jobs:
               elif "not enabled" in (disabled.stderr or disabled.stdout or "").lower():
                   say(f"PR #{number}: auto-merge was not enabled.")
               else:
-                  say(
-                      f"::warning::PR #{number}: gh pr merge --disable-auto: "
-                      + (disabled.stderr.strip() or disabled.stdout.strip())
+                  detail = neutralize_actions_log_text(
+                      (disabled.stderr or disabled.stdout or "").strip()
                   )
+                  say(f"::error::PR #{number}: gh pr merge --disable-auto failed: " + detail)
+                  sys.exit(1)
               sys.exit(0)
           merged = subprocess.run(
               ["gh", "pr", "merge", number, "--auto", "--squash", "--match-head-commit", sha, "--repo", repo],
@@ -266,9 +279,11 @@ jobs:
               text=True,
           )
           if merged.returncode != 0:
+              detail = neutralize_actions_log_text(
+                  (merged.stderr or merged.stdout or "").strip()
+              )
               say(
-                  f"::error::PR #{number} ({sha[:7]}): gh pr merge --auto refused: "
-                  + (merged.stderr.strip() or merged.stdout.strip())
+                  f"::error::PR #{number} ({sha[:7]}): gh pr merge --auto refused: " + detail
               )
               sys.exit(1)
           say(

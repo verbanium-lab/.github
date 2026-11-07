@@ -329,11 +329,16 @@ class DefaultsTests(unittest.TestCase):
         def add_rest(w):
             step = w['jobs']['gate']['steps'][-1]
             step['run'] = step['run'] + ' pulls/{number}/merge'
+        def bad_gate_ref_checkout(w):
+            checkout = next(s for s in w['jobs']['gate']['steps'] if s.get('uses', '').startswith('actions/checkout@'))
+            checkout['with']['ref'] = '${{ github.workflow_sha }}'
         for mutate in (
             lambda w: w.update(on={'pull_request_target': None}),
             lambda w: w['jobs']['gate'].update(permissions={'contents': 'write'}),
             lambda w: w['jobs']['gate'].pop('environment'),
             lambda w: w[True]['workflow_call']['secrets'].update(EXTRA={'required': False}),
+            lambda w: w[True]['workflow_call']['inputs'].pop('gate-ref'),
+            bad_gate_ref_checkout,
             strip_auto,
             strip_decide,
             add_rest,

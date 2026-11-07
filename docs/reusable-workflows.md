@@ -734,7 +734,55 @@ behind the environment branch rule, and this workflow checks the PR shape before
 requests and those with `risk:high` never qualify. The owner still approves; this workflow does not
 change branch protection or organization rulesets.
 
-Guards (all configurable through inputs; defaults shown):
+### Pinning `gate-ref` and the reusable workflow
+
+Callers pin **two** reviewed full commit SHAs from `verbanium-lab/.github`:
+
+| Pin | What it selects |
+| --- | --- |
+| `REVIEWED_WORKFLOW_COMMIT` on the `uses:` line | The reviewed `risk-low-automerge.yml` workflow definition (caller workflow file on the default branch) |
+| `GATE_SCRIPT_COMMIT` passed as input `gate-ref` | The exact commit whose `risk_low_automerge.py` is sparse-checked out and executed |
+
+`gate-ref` is required, has no default, and must be a 40-character lowercase hex Git commit SHA. The
+reusable workflow validates it in the plan step and checks out `verbanium-lab/.github` at that ref only
+(do not use `github.workflow_sha`: that is the **caller's** workflow commit, so checkout would fail or
+run PR-supplied script code on self-call).
+
+Bump `gate-ref` in the caller repository when `risk_low_automerge.py` or its minimum protected-path set
+changes on `.github` `main`, after owner review. Bump `REVIEWED_WORKFLOW_COMMIT` when `risk-low-automerge.yml`
+or other reusable inputs change. Keep both pins equal only when a single reviewed commit ships both files.
+
+### Caller triggers (no PR-head workflow definition)
+
+Run the caller from the **default branch** workflow file only. Do not use `pull_request`: the workflow
+and `protected-paths` input would come from the PR merge commit and a PR could weaken the gate.
+
+Use **`workflow_run`** after caller `CI` succeeds (reads checks on the current head), and/or
+**`pull_request_target`** for label and draft lifecycle events. The caller job must not check out or
+execute code from the pull request head. Triggers on `pull_request_target`:
+
+`labeled`, `unlabeled`, `synchronize`, `ready_for_review`, `converted_to_draft`, `edited`, `reopened`
+
+Removing `risk:low` or converting to draft re-runs the gate, which disables auto-merge when guards fail.
+
+### Required checks and advisory AI review
+
+Configure the caller ruleset so this gate job's check name (for example `Risk low auto-merge / gate`) is
+**required** on pull requests that may use platform auto-merge. The organization `ai-review` check is
+**advisory-only** in branch rules on its own: it does not block merge unless the owner also lists it as
+required. The gate still requires both `required-check` (default `ci`) and `ai-review-check` (default
+`ai-review`) to be green on the pinned head before enabling auto-merge.
+
+### App token permissions (auto-merge)
+
+The workflow mints a verbanium-ci installation token with `permission-contents: read` and
+`permission-pull-requests: write`, then calls `gh pr merge --auto` and `gh pr merge --disable-auto`.
+**Not verified offline:** whether GraphQL `enablePullRequestAutoMerge` needs additional repository
+permissions beyond `pull_requests: write` (some docs mention `contents: write` for merge queue flows).
+Treat `pull_requests: write` as the minimum documented scope; confirm on the first live caller run and
+record evidence before widening.
+
+### Guards
 
 - label `risk:low` present and label `risk:high` absent;
 - not a draft; base branch matches `base-branch` (default `main`); head branch in the same repository;
@@ -742,19 +790,25 @@ Guards (all configurable through inputs; defaults shown):
   `allowed-authors` as `login|Type` pairs matched on both fields;
 - changed paths include current and previous filenames (renames and deletions); if the files API list
   reaches 3000 entries or the changed-file count is unknown, the gate refuses auto-merge;
-- no changed path matches a glob in `protected-paths` (defaults include workflows, CODEOWNERS,
-  `**/.sops.yaml`, `**/secrets/**`);
+- no changed path matches the **minimum** protected globs baked into `risk_low_automerge.py` (callers
+  cannot remove these) union any extra globs in `protected-paths` (default empty);
 - the latest GitHub Actions check run per name (by `started_at` and `id`) for `required-check`
   (default `ci`, `actions-app-id` default `15368`) and `ai-review-check` (default `ai-review`,
   `ai-review-actions-app-id` default `15368` for non-Actions reviewers) completed successfully on the
   pinned PR head.
 
+Baked-in minimum protected paths (always enforced): `.github/**`, `**/CODEOWNERS`, `CODEOWNERS`,
+`justfile`, `lefthook.yml`, `**/.sops.yaml`, `**/secrets/**`, `package.json`, `pnpm-lock.yaml`,
+`pnpm-workspace.yaml`, `Dockerfile*`, `**/Dockerfile*`.
+
 When guards pass, the workflow enables squash auto-merge with `gh pr merge --match-head-commit` on the
 PR head SHA decided at evaluation time. A new push needs a fresh gate run. When guards fail, it runs
-`gh pr merge --disable-auto` idempotently and records that in the job summary.
+`gh pr merge --disable-auto` idempotently; failures other than “auto-merge is not enabled” fail the job.
+PR file names and API error text are neutralized before `::notice::` / `::error::` and the job summary.
 
-Pin by reviewed commit. The job uses the caller `production` environment and organization secret
-`VERBANIUM_CI_PRIVATE_KEY`; checks are read with the job token, auto-merge is requested with the App token.
+Pin the reusable workflow by reviewed commit. The job uses the caller `production` environment and
+organization secret `VERBANIUM_CI_PRIVATE_KEY`; checks are read with the job token, auto-merge is
+requested with the App token.
 
 ### Caller example
 
@@ -762,9 +816,16 @@ Pin by reviewed commit. The job uses the caller `production` environment and org
 name: Risk low auto-merge
 
 on:
-  pull_request:
-    types: [labeled, synchronize, ready_for_review]
-  workflow_run:
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types:
+      - labeled
+      - unlabeled
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - edited
+      - reopened
+  workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows: [CI]
     types: [completed]
 
@@ -773,7 +834,7 @@ permissions: {}
 jobs:
   risk-low-automerge:
     if: >-
-      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      github.event_name == 'pull_request_target' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     permissions:
@@ -784,18 +845,16 @@ jobs:
       VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
     with:
       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+      gate-ref: GATE_SCRIPT_COMMIT
       pr-number: >-
-        ${{ github.event_name == 'pull_request' && github.event.pull_request.number ||
+        ${{ github.event_name == 'pull_request_target' && github.event.pull_request.number ||
             github.event.workflow_run.pull_requests[0].number }}
       agent-bot-id: "341351550"
-      protected-paths: |
-        .github/workflows/**
-        .github/CODEOWNERS
-        **/.sops.yaml
-        **/secrets/**
 ```
 
-Re-run on `workflow_run` after `CI` completes so the required check and `ai-review-check` are green on
-the current head. Pin `agent-bot-id` to the dispatch agent's numeric user id. Offline tests cover
-`risk_low_automerge` path matching, renamed files, check-run selection and `decide`; they do not prove
-live auto-merge or ruleset behavior on the caller repository.
+Do not add a checkout step in this caller job. Re-run on `workflow_run` after `CI` completes so
+`required-check` and `ai-review-check` are green on the current head. Pin `agent-bot-id` to the
+dispatch agent's numeric user id. Add repository-specific extra globs only through `protected-paths`
+when needed (optional). Offline tests cover `risk_low_automerge` path matching, minimum protected
+paths, renamed files, check-run selection and `decide`; they do not prove live auto-merge or ruleset
+behavior on the caller repository.

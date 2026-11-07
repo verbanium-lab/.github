@@ -499,7 +499,7 @@ def validate_reusable(workflow, kind):
         require(set(secrets) == {"VERBANIUM_CI_PRIVATE_KEY"} and secrets["VERBANIUM_CI_PRIVATE_KEY"].get("required") is True,
                 "the verbanium-ci key is the only secret")
         declared = call.get("inputs", {})
-        required = {"client-id", "pr-number"}
+        required = {"client-id", "gate-ref", "pr-number"}
         optional = {
             "required-check": ("ci", "string"),
             "ai-review-check": ("ai-review", "string"),
@@ -510,8 +510,9 @@ def validate_reusable(workflow, kind):
             "actions-app-id": ("15368", "string"),
             "ai-review-actions-app-id": ("15368", "string"),
             "base-branch": ("main", "string"),
+            "protected-paths": ("", "string"),
         }
-        require(set(declared) == required | set(optional) | {"protected-paths"}, "reviewed automerge inputs only")
+        require(set(declared) == required | set(optional), "reviewed automerge inputs only")
         for name in required:
             field = declared[name]
             require(field.get("type") == "string" and field.get("required") is True and "default" not in field,
@@ -520,11 +521,8 @@ def validate_reusable(workflow, kind):
             field = declared[name]
             require(field.get("type") == kind_name and not field.get("required") and field.get("default") == default,
                     "optional automerge input default: " + name)
-        protected = declared["protected-paths"]
-        require(protected.get("type") == "string" and not protected.get("required")
-                and ".github/workflows" in protected.get("default", "")
-                and "CODEOWNERS" in protected.get("default", "")
-                and "**/secrets/**" in protected.get("default", ""), "protected-paths default boundary")
+        gate_ref = declared["gate-ref"]
+        require("workflow_sha" not in repr(declared), "gate-ref must not default to workflow_sha")
         job = jobs["gate"]
         require(job.get("permissions") == {"checks": "read", "contents": "read"} and "needs" not in job and "if" not in job,
                 "gate job token reads checks and gate scripts; always runs")
@@ -534,6 +532,7 @@ def validate_reusable(workflow, kind):
         plan = steps[0] if steps else {}
         expected_plan = {
             "CLIENT_ID": "${{ inputs.client-id }}",
+            "GATE_REF": "${{ inputs.gate-ref }}",
             "PR_NUMBER": "${{ inputs.pr-number }}",
             "REQUIRED_CHECK": "${{ inputs.required-check }}",
             "AI_REVIEW_CHECK": "${{ inputs.ai-review-check }}",
@@ -552,9 +551,12 @@ def validate_reusable(workflow, kind):
             require("inputs." not in repr(step), "raw inputs may only enter the validation step through env")
         checkout = next((s for s in steps if s.get("uses", "").startswith("actions/checkout@")), None)
         require(checkout is not None and checkout.get("with", {}).get("repository") == "verbanium-lab/.github"
-                and checkout.get("with", {}).get("ref") == "${{ github.workflow_sha }}"
+                and checkout.get("with", {}).get("ref") == "${{ steps.plan.outputs.gate-ref }}"
                 and "risk_low_automerge.py" in checkout.get("with", {}).get("sparse-checkout", ""),
                 "gate scripts sparse checkout required")
+        plan_run = plan.get("run", "")
+        require('"$GATE_REF" =~ ^[0-9a-f]{40}$' in plan_run, "gate-ref sha validation required in plan")
+        require("gate-ref=$GATE_REF" in plan_run, "gate-ref plan output required")
         token = next((s for s in steps if s.get("uses", "").startswith("actions/create-github-app-token@")), None)
         require(token is not None and token.get("with", {}).get("permission-contents") == "read"
                 and token.get("with", {}).get("permission-pull-requests") == "write",
@@ -562,12 +564,15 @@ def validate_reusable(workflow, kind):
         run = " ".join(s.get("run", "") for s in steps)
         for needle in (
             "from risk_low_automerge import decide",
+            "neutralize_actions_log_text",
             "paths_from_pr_files",
             '["gh", "pr", "merge"',
             '"--auto"',
             '"--squash"',
             '"--match-head-commit"',
             '"--disable-auto"',
+            "::error::PR #",
+            "disable-auto failed",
             "HIGH_RISK_LABEL",
             "LOW_RISK_LABEL",
             "AI_REVIEW_CHECK",
@@ -577,6 +582,9 @@ def validate_reusable(workflow, kind):
         require("pulls/{number}/merge" not in run and "merge_method=squash" not in run and "--admin" not in run,
                 "platform auto-merge only; no direct REST merge or admin")
         require("release-please--branches--main" not in run, "release PR merge boundary must not overlap")
+        script = (Path(__file__).resolve().parent / "risk_low_automerge.py").read_text(encoding="utf-8")
+        for needle in ("MINIMUM_PROTECTED_PATTERNS", ".github/**", "pnpm-lock.yaml", "Dockerfile*"):
+            require(needle in script, "minimum protected paths baked into gate script: " + needle)
         gate_step = steps[-1]
         require(gate_step.get("env") == {"GH_TOKEN": "${{ steps.app.outputs.token }}", "CHECKS_TOKEN": "${{ github.token }}"}
                 or set(gate_step.get("env", {})) >= {"GH_TOKEN", "CHECKS_TOKEN"},

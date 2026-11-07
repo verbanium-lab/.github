@@ -46,7 +46,7 @@ def base_kwargs(**overrides):
         check_runs=(run("ci"), run("ai-review")),
         low_risk_label="risk:low",
         high_risk_label="risk:high",
-        protected_patterns=(".github/workflows/**", "**/.sops.yaml", "**/secrets/**"),
+        protected_patterns=(),
         allowed_authors=frozenset(),
         agent_bot_id=AGENT_BOT_ID,
         required_check="ci",
@@ -82,6 +82,12 @@ class DecideTests(unittest.TestCase):
 
     def test_protected_path_blocks(self):
         self.assert_skip("protected", changed_files=(".github/workflows/ci.yml",))
+
+    def test_minimum_protected_package_json_without_caller_patterns(self):
+        self.assert_skip("protected", changed_files=("package.json",))
+
+    def test_minimum_protected_dockerfile_glob(self):
+        self.assert_skip("protected", changed_files=("apps/api/Dockerfile.prod",))
 
     def test_author_allowlist_requires_type(self):
         self.assert_enable(
@@ -176,6 +182,14 @@ class GlobTests(unittest.TestCase):
         self.assertIsNotNone(gate.path_matches_protected(".sops.yaml", patterns))
         self.assertIsNotNone(gate.path_matches_protected("secrets/x", patterns))
 
+    def test_dockerfile_suffix_glob(self):
+        patterns = ("Dockerfile*", "**/Dockerfile*")
+        self.assertEqual(gate.path_matches_protected("Dockerfile", patterns), "Dockerfile*")
+        self.assertEqual(gate.path_matches_protected("Dockerfile.prod", patterns), "Dockerfile*")
+        self.assertEqual(
+            gate.path_matches_protected("apps/api/Dockerfile.prod", patterns), "**/Dockerfile*"
+        )
+
 
 class CheckRunLatestTests(unittest.TestCase):
     def test_rerun_in_progress_blocks(self):
@@ -220,6 +234,22 @@ class HelperTests(unittest.TestCase):
         block = gate.github_actions_output_value("paths", "a\nb")
         self.assertIn("paths<<", block)
         self.assertIn("a\nb", block)
+
+    def test_github_actions_output_rejects_percent_newline(self):
+        with self.assertRaises(ValueError):
+            gate.github_actions_output_value("x", "a%0Ab")
+
+    def test_effective_protected_includes_minimum(self):
+        merged = gate.effective_protected_patterns(("extra/path/**",))
+        self.assertIn(".github/**", merged)
+        self.assertIn("package.json", merged)
+        self.assertIn("extra/path/**", merged)
+
+    def test_neutralize_strips_injection(self):
+        dirty = "path\nfoo::notice::\rbar"
+        clean = gate.neutralize_actions_log_text(dirty)
+        self.assertNotIn("\n", clean)
+        self.assertNotIn("::", clean)
 
 
 if __name__ == "__main__":

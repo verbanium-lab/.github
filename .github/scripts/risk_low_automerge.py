@@ -13,6 +13,22 @@ from typing import Any, Iterable, Mapping, Sequence
 # GitHub caps pull request file lists at 3000 entries.
 PR_FILES_LIST_MAX = 3000
 
+# Callers may only add paths; this set is always enforced and cannot be narrowed through inputs.
+MINIMUM_PROTECTED_PATTERNS: tuple[str, ...] = (
+    ".github/**",
+    "**/CODEOWNERS",
+    "CODEOWNERS",
+    "justfile",
+    "lefthook.yml",
+    "**/.sops.yaml",
+    "**/secrets/**",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "Dockerfile*",
+    "**/Dockerfile*",
+)
+
 
 @dataclass(frozen=True)
 class Decision:
@@ -47,8 +63,39 @@ def parse_patterns(text: str) -> tuple[str, ...]:
     return tuple(line.strip() for line in text.splitlines() if line.strip())
 
 
+def effective_protected_patterns(additional: Sequence[str]) -> tuple[str, ...]:
+    """Union the baked-in minimum protected paths with caller-supplied extras."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for pattern in (*MINIMUM_PROTECTED_PATTERNS, *additional):
+        if pattern not in seen:
+            seen.add(pattern)
+            ordered.append(pattern)
+    return tuple(ordered)
+
+
+def neutralize_actions_log_text(text: str) -> str:
+    """Strip workflow log and summary injection from PR-derived strings."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .replace("::", " ")
+    )
+
+
 def path_has_dotdot(filename: str) -> bool:
     return any(segment == ".." for segment in filename.split("/"))
+
+
+def _segment_match(path_segment: str, pattern_segment: str) -> bool:
+    if pattern_segment == "*":
+        return bool(path_segment)
+    if "*" not in pattern_segment:
+        return path_segment == pattern_segment
+    if pattern_segment.count("*") != 1 or not pattern_segment.endswith("*"):
+        return False
+    return path_segment.startswith(pattern_segment[:-1])
 
 
 def _glob_match(path_segments: Sequence[str], pattern_segments: Sequence[str]) -> bool:
@@ -69,10 +116,7 @@ def _glob_match(path_segments: Sequence[str], pattern_segments: Sequence[str]) -
             return False
         if pi >= len(path_segments):
             return False
-        if token == "*":
-            if not path_segments[pi]:
-                return False
-        elif token != path_segments[pi]:
+        if not _segment_match(path_segments[pi], token):
             return False
         pi += 1
         ti += 1
@@ -224,8 +268,9 @@ def decide(
     ):
         reasons.append(f"author {author_login!r} is not allowed")
 
+    patterns = effective_protected_patterns(protected_patterns)
     for filename in changed_files:
-        pattern = path_matches_protected(filename, protected_patterns)
+        pattern = path_matches_protected(filename, patterns)
         if pattern is not None:
             reasons.append(f"protected path {filename!r} matches {pattern!r}")
 
@@ -266,7 +311,9 @@ def decide_from_payload(payload: Mapping[str, Any]) -> Decision:
         check_runs=tuple(payload.get("check_runs") or ()),
         low_risk_label=str(payload["low_risk_label"]),
         high_risk_label=str(payload["high_risk_label"]),
-        protected_patterns=parse_patterns(str(payload.get("protected_paths") or "")),
+        protected_patterns=effective_protected_patterns(
+            parse_patterns(str(payload.get("protected_paths") or ""))
+        ),
         allowed_authors=parse_allowed_authors(str(payload.get("allowed_authors") or "")),
         agent_bot_id=parse_agent_bot_id(agent_bot_raw),
         required_check=str(payload["required_check"]),
@@ -278,11 +325,19 @@ def decide_from_payload(payload: Mapping[str, Any]) -> Decision:
     )
 
 
+def github_actions_output_safe_name(name: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise ValueError("output name must be alphanumeric, underscore or hyphen")
+
+
 def github_actions_output_value(name: str, value: str) -> str:
     """Format a name=value or multiline block safe for appending to GITHUB_OUTPUT."""
+    github_actions_output_safe_name(name)
     if "\n" in value or "\r" in value:
         delimiter = f"GATE_{name.upper()}"
         return f"{name}<<{delimiter}\n{value}\n{delimiter}\n"
+    if "%0A" in value or "%0D" in value:
+        raise ValueError("output value must not encode newlines")
     return f"{name}={value}\n"
 
 
