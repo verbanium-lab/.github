@@ -1,0 +1,233 @@
+# Enables platform auto-merge (squash) for caller pull requests that satisfy the risk:low gate.
+# The owner still approves in review; this workflow only turns on GitHub auto-merge when every
+# guard passes. risk:high and unlabeled pull requests never qualify.
+#
+# Callers pin this file by reviewed commit and pass every policy knob through inputs (no embedded
+# reviewer or model names). The AI review check name is an input (default ai-review); the check
+# itself is produced elsewhere (engine-apps#26).
+#
+# Example caller — see docs/reusable-workflows.md#risk-low-auto-merge.
+
+name: Risk low auto-merge
+
+on:
+  workflow_call:
+    inputs:
+      client-id:
+        description: verbanium-ci App client ID (vars.VERBANIUM_CI_CLIENT_ID of the caller)
+        required: true
+        type: string
+      pr-number:
+        description: Pull request number to evaluate
+        required: true
+        type: string
+      required-check:
+        description: Required CI check name on the PR head (GitHub Actions app on the caller repo)
+        default: ci
+        type: string
+      ai-review-check:
+        description: Advisory AI reviewer check name that must succeed on the PR head
+        default: ai-review
+        type: string
+      low-risk-label:
+        description: Label that must be present
+        default: risk:low
+        type: string
+      high-risk-label:
+        description: Label that blocks auto-merge when present
+        default: risk:high
+        type: string
+      protected-paths:
+        description: Newline-separated globs; any changed file that matches blocks auto-merge
+        default: |
+          .github/workflows/**
+          .github/CODEOWNERS
+          **/.sops.yaml
+          **/secrets/**
+        type: string
+      allowed-authors:
+        description: Comma-separated extra author logins allowed besides agent bot accounts
+        default: ""
+        type: string
+      agent-author-regex:
+        description: Full-match regex for bot agent authors (type Bot)
+        default: .*\[bot\]$
+        type: string
+      actions-app-id:
+        description: GitHub App id for Actions check runs trusted by the caller ruleset
+        default: "15368"
+        type: string
+      base-branch:
+        description: Pull request base branch that may auto-merge
+        default: main
+        type: string
+    secrets:
+      VERBANIUM_CI_PRIVATE_KEY:
+        description: verbanium-ci App private key (organization secret)
+        required: true
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      checks: read
+    environment:
+      name: production
+      deployment: false
+    steps:
+      - name: Validate inputs
+        id: plan
+        env:
+          CLIENT_ID: ${{ inputs.client-id }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          REQUIRED_CHECK: ${{ inputs.required-check }}
+          AI_REVIEW_CHECK: ${{ inputs.ai-review-check }}
+          LOW_RISK_LABEL: ${{ inputs.low-risk-label }}
+          HIGH_RISK_LABEL: ${{ inputs.high-risk-label }}
+          PROTECTED_PATHS: ${{ inputs.protected-paths }}
+          ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
+          AGENT_AUTHOR_REGEX: ${{ inputs.agent-author-regex }}
+          ACTIONS_APP_ID: ${{ inputs.actions-app-id }}
+          BASE_BRANCH: ${{ inputs.base-branch }}
+        run: |
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::pr-number must be digits"; exit 1; }
+          [[ "$CLIENT_ID" =~ ^Iv[0-9A-Za-z.]{10,40}$ ]] || { echo "::error::invalid client-id"; exit 1; }
+          [[ "$AGENT_AUTHOR_REGEX" != "" ]] || { echo "::error::agent-author-regex must not be empty"; exit 1; }
+          [[ "$ACTIONS_APP_ID" =~ ^[0-9]+$ ]] || { echo "::error::actions-app-id must be digits"; exit 1; }
+          {
+            echo "client-id=$CLIENT_ID"
+            echo "pr-number=$PR_NUMBER"
+            echo "required-check=$REQUIRED_CHECK"
+            echo "ai-review-check=$AI_REVIEW_CHECK"
+            echo "low-risk-label=$LOW_RISK_LABEL"
+            echo "high-risk-label=$HIGH_RISK_LABEL"
+            echo "allowed-authors=$ALLOWED_AUTHORS"
+            echo "agent-author-regex=$AGENT_AUTHOR_REGEX"
+            echo "actions-app-id=$ACTIONS_APP_ID"
+            echo "base-branch=$BASE_BRANCH"
+            echo "protected-paths<<GATE_PATHS"
+            printf '%s\n' "$PROTECTED_PATHS"
+            echo GATE_PATHS
+          } >> "$GITHUB_OUTPUT"
+      - name: Check out gate scripts
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: verbanium-lab/.github
+          ref: ${{ github.action_ref }}
+          path: _github-defaults
+          persist-credentials: false
+          sparse-checkout: .github/scripts/risk_low_automerge.py
+      - name: Mint verbanium-ci token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ steps.plan.outputs.client-id }}
+          private-key: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+      - name: Evaluate pull request and enable auto-merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CHECKS_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.plan.outputs.pr-number }}
+          REQUIRED_CHECK: ${{ steps.plan.outputs.required-check }}
+          AI_REVIEW_CHECK: ${{ steps.plan.outputs.ai-review-check }}
+          LOW_RISK_LABEL: ${{ steps.plan.outputs.low-risk-label }}
+          HIGH_RISK_LABEL: ${{ steps.plan.outputs.high-risk-label }}
+          PROTECTED_PATHS: ${{ steps.plan.outputs.protected-paths }}
+          ALLOWED_AUTHORS: ${{ steps.plan.outputs.allowed-authors }}
+          AGENT_AUTHOR_REGEX: ${{ steps.plan.outputs.agent-author-regex }}
+          ACTIONS_APP_ID: ${{ steps.plan.outputs.actions-app-id }}
+          BASE_BRANCH: ${{ steps.plan.outputs.base-branch }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          sys.path.insert(0, "_github-defaults/.github/scripts")
+          from risk_low_automerge import decide, parse_list, parse_patterns
+
+          repo = os.environ["REPO"]
+          number = os.environ["PR_NUMBER"]
+          summary = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+
+          def say(message):
+              print(message)
+              summary.write(message + "\n")
+
+          def pages(path, token=None):
+              env = dict(os.environ, GH_TOKEN=token) if token else None
+              out = subprocess.run(
+                  ["gh", "api", "--paginate", "--slurp", path],
+                  capture_output=True,
+                  text=True,
+                  check=True,
+                  env=env,
+              ).stdout
+              return json.loads(out)
+
+          def api_items(path):
+              return [item for page in pages(path) for item in page]
+
+          pr = json.loads(
+              subprocess.run(
+                  ["gh", "api", f"repos/{repo}/pulls/{number}"],
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              ).stdout
+          )
+          sha = pr["head"]["sha"]
+          labels = api_items(f"repos/{repo}/issues/{number}/labels?per_page=100")
+          label_names = {item["name"] for item in labels}
+          files = api_items(f"repos/{repo}/pulls/{number}/files?per_page=100")
+          changed = [item["filename"] for item in files]
+          check_pages = pages(
+              f"repos/{repo}/commits/{sha}/check-runs?per_page=100",
+              os.environ["CHECKS_TOKEN"],
+          )
+          check_runs = [run for page in check_pages for run in page.get("check_runs", [])]
+          head_repo = (pr.get("head") or {}).get("repo") or {}
+          decision = decide(
+              label_names=frozenset(label_names),
+              draft=bool(pr.get("draft")),
+              author_login=(pr.get("user") or {}).get("login", ""),
+              author_type=(pr.get("user") or {}).get("type", ""),
+              base_branch=os.environ["BASE_BRANCH"],
+              pr_base=pr.get("base", {}).get("ref", ""),
+              head_repo_full_name=head_repo.get("full_name", ""),
+              caller_repo=repo,
+              changed_files=tuple(changed),
+              check_runs=tuple(check_runs),
+              low_risk_label=os.environ["LOW_RISK_LABEL"],
+              high_risk_label=os.environ["HIGH_RISK_LABEL"],
+              protected_patterns=parse_patterns(os.environ["PROTECTED_PATHS"]),
+              allowed_authors=parse_list(os.environ["ALLOWED_AUTHORS"]),
+              agent_author_regex=os.environ["AGENT_AUTHOR_REGEX"],
+              required_check=os.environ["REQUIRED_CHECK"],
+              ai_review_check=os.environ["AI_REVIEW_CHECK"],
+              actions_app_id=int(os.environ["ACTIONS_APP_ID"]),
+          )
+          if not decision.enable_auto_merge:
+              say(f"::notice::PR #{number}: auto-merge not enabled — " + "; ".join(decision.reasons))
+              sys.exit(0)
+          merged = subprocess.run(
+              ["gh", "pr", "merge", number, "--auto", "--squash", "--repo", repo],
+              capture_output=True,
+              text=True,
+          )
+          if merged.returncode != 0:
+              say(
+                  f"::error::PR #{number} ({sha[:7]}): gh pr merge --auto refused: "
+                  + (merged.stderr.strip() or merged.stdout.strip())
+              )
+              sys.exit(1)
+          say(f"PR #{number} ({sha[:7]}): enabled squash auto-merge after gate checks passed.")
+          PY

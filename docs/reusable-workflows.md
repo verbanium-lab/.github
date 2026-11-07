@@ -725,3 +725,63 @@ Risk: whoever holds the verbanium-ci private key (an organization secret used on
 jobs in `production` environments) could merge any open PR whose checks pass, without approval.
 Mitigations: the key never leaves GitHub Actions secrets, the jobs that read it run only on `main`
 behind the environment branch rule, and this workflow checks the PR shape before merging.
+
+
+## Risk low auto-merge
+
+`.github/workflows/risk-low-automerge.yml` enables GitHub platform auto-merge (`gh pr merge --auto
+--squash`) only when every guard passes on the pull request identified by `pr-number`. Unlabeled pull
+requests and those with `risk:high` never qualify. The owner still approves; this workflow does not
+change branch protection or organization rulesets.
+
+Guards (all configurable through inputs; defaults shown):
+
+- label `risk:low` present and label `risk:high` absent;
+- not a draft; base branch matches `base-branch` (default `main`); head branch in the same repository;
+- author matches `agent-author-regex` with user type `Bot`, or appears in `allowed-authors`;
+- no changed file matches a glob in `protected-paths` (default includes workflows, CODEOWNERS, sops, secrets);
+- GitHub Actions check runs named `required-check` (default `ci`) and `ai-review-check` (default
+  `ai-review`) completed successfully on the PR head (`actions-app-id`, default `15368`).
+
+Pin by reviewed commit. The job uses the caller `production` environment and organization secret
+`VERBANIUM_CI_PRIVATE_KEY`; checks are read with the job token, auto-merge is requested with the App token.
+
+### Caller example
+
+```yaml
+name: Risk low auto-merge
+
+on:
+  pull_request:
+    types: [labeled, synchronize, ready_for_review]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  risk-low-automerge:
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    permissions:
+      checks: read
+    uses: verbanium-lab/.github/.github/workflows/risk-low-automerge.yml@REVIEWED_WORKFLOW_COMMIT
+    secrets:
+      VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+    with:
+      client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+      pr-number: >-
+        ${{ github.event_name == 'pull_request' && github.event.pull_request.number ||
+            github.event.workflow_run.pull_requests[0].number }}
+      protected-paths: |
+        .github/workflows/**
+        .github/CODEOWNERS
+        **/.sops.yaml
+```
+
+Re-run on `workflow_run` after `CI` completes so the required check and `ai-review-check` are green on
+the current head. Offline tests cover `risk_low_automerge.decide`; they do not prove live auto-merge
+or ruleset behavior on the caller repository.

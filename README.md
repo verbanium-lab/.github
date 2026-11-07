@@ -34,12 +34,22 @@ local check and the owner-controlled activation steps.
 | [deployed-tag.yml](.github/workflows/deployed-tag.yml) | Moves `deployed-<env>` to the digest that runs in an environment, without pulling layers |
 | [status.yml](.github/workflows/status.yml) | Refreshes the README status table from releases, GHCR deployed tags and optional coverage |
 | [deploy-coolify.yml](.github/workflows/deploy-coolify.yml) | Deploys a main image digest to a Coolify application over an ephemeral tailnet node, records the GitHub Deployment, waits for the live build |
+| [risk-low-automerge.yml](.github/workflows/risk-low-automerge.yml) | Enables squash auto-merge for `risk:low` agent pull requests when CI, AI review and path guards pass |
 | [release-notify.yml](.github/workflows/release-notify.yml) | Telegram notice for every `<component>-vX.Y.Z` tag that release-please created in the caller |
 | [release.yml](.github/workflows/release.yml) | **Deprecated** (one SemVer scheme, ADR 0009 amendment 2026-11-01 b): date-sha release per main image; no callers left |
 
 See [caller recipes and adoption requirements](docs/reusable-workflows.md) for fixed-app wiki and
 affected-matrix Tower examples, release-commit filters and token boundaries. Unresolved action pins
 must be completed before adoption. This change does not migrate any app caller.
+
+## Risk low auto-merge
+
+`risk-low-automerge.yml` is a reusable gate: callers pass the pull request number and policy inputs
+(check names, labels, protected path globs, allowed authors). When every guard passes, the job runs
+`gh pr merge --auto --squash` so GitHub merges after required checks (and merge queue, if configured).
+`risk:high` and unlabeled pull requests never qualify. The owner still reviews and approves; this
+workflow does not change organization settings. Caller recipe:
+[reusable-workflows.md](docs/reusable-workflows.md#risk-low-auto-merge).
 
 ## Protect the deployed digest
 

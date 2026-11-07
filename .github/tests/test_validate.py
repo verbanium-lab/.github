@@ -154,7 +154,7 @@ class DefaultsTests(unittest.TestCase):
     def reusable(self, kind):
         name = {'image': 'image', 'cleanup': 'ghcr-cleanup', 'deployed': 'deployed-tag',
                 'release': 'release', 'notify': 'release-notify', 'status': 'status',
-                'deploy': 'deploy-coolify', 'merge': 'release-pr-merge'}[kind]
+                'deploy': 'deploy-coolify', 'merge': 'release-pr-merge', 'automerge': 'risk-low-automerge'}[kind]
         workflow = validator.load_yaml(ROOT / f'.github/workflows/{name}.yml')
         # Synthetic pinned references isolate boundary rejection tests from the offline pin gate.
         for job in workflow['jobs'].values():
@@ -316,6 +316,33 @@ class DefaultsTests(unittest.TestCase):
             mutate(workflow)
             with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
                 validator.validate_reusable(workflow, 'status')
+
+
+    def test_risk_low_automerge_boundary_rejections(self):
+        self.assertIsNone(validator.validate_reusable(self.reusable('automerge'), 'automerge'))
+        def strip_auto(w):
+            step = w['jobs']['gate']['steps'][-1]
+            step['run'] = step['run'].replace('"--auto"', '')
+        def strip_decide(w):
+            step = w['jobs']['gate']['steps'][-1]
+            step['run'] = step['run'].replace('from risk_low_automerge import decide', '')
+        def add_rest(w):
+            step = w['jobs']['gate']['steps'][-1]
+            step['run'] = step['run'] + ' pulls/{number}/merge'
+        for mutate in (
+            lambda w: w.update(on={'pull_request_target': None}),
+            lambda w: w['jobs']['gate'].update(permissions={'contents': 'write'}),
+            lambda w: w['jobs']['gate'].pop('environment'),
+            lambda w: w[True]['workflow_call']['secrets'].update(EXTRA={'required': False}),
+            strip_auto,
+            strip_decide,
+            add_rest,
+        ):
+            workflow = self.reusable('automerge')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'automerge')
+
 
     def test_release_pr_merge_boundary_rejections(self):
         self.assertIsNone(validator.validate_reusable(self.reusable('merge'), 'merge'))
