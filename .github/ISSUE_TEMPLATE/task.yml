@@ -64,4 +64,4 @@ body:
     id: depends
     attributes:
       label: Depends on
-      description: "Issue links: #12 or verbanium-lab/verbanium#3. Empty if none."
+      description: "Issue links: #12 or verbanium-lab/infra#3. Empty if none."
