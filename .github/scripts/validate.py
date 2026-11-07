@@ -22,9 +22,12 @@ OWNED_FILES = {
     ".github/workflows/deployed-tag.yml", ".github/workflows/release.yml",
     ".github/workflows/release-notify.yml", ".github/workflows/deploy-coolify.yml",
     ".github/workflows/status.yml", ".github/workflows/release-pr-merge.yml",
+    ".github/workflows/risk-low-automerge.yml",
+    ".github/scripts/risk_low_automerge.py",
     ".github/scripts/collect_status.py", ".github/scripts/render_status.py",
     ".github/tests/test_status.py",
-    ".github/tests/test_workflows.py", "docs/reusable-workflows.md",
+    ".github/tests/test_workflows.py", ".github/tests/test_risk_low_automerge.py",
+    "docs/reusable-workflows.md",
     "lefthook.yml", ".github/scripts/hooks/pre-push.sh", ".github/scripts/hooks/staged.sh",
 }
 FIELDS = {
@@ -232,6 +235,7 @@ def validate_reusable(workflow, kind):
         "deploy": {"actions/create-github-app-token", "tailscale/github-action"},
         "status": {"actions/checkout", "actions/download-artifact"},
         "merge": {"actions/create-github-app-token"},
+        "automerge": {"actions/checkout", "actions/create-github-app-token"},
     }[kind]
     for job in jobs.values():
         require(isinstance(job, dict) and "uses" not in job, "local reusable jobs required")
@@ -489,7 +493,104 @@ def validate_reusable(workflow, kind):
         merge_step = steps[-1]
         require(merge_step.get("env") == {"GH_TOKEN": "${{ steps.app.outputs.token }}", "CHECKS_TOKEN": "${{ github.token }}"},
                 "App token for the merge, job token only for reading checks")
+    elif kind == "automerge":
+        require(set(jobs) == {"gate"}, "one gate job required")
+        secrets = call.get("secrets", {})
+        require(set(secrets) == {"VERBANIUM_CI_PRIVATE_KEY"} and secrets["VERBANIUM_CI_PRIVATE_KEY"].get("required") is True,
+                "the verbanium-ci key is the only secret")
+        declared = call.get("inputs", {})
+        required = {"client-id", "gate-ref", "pr-number"}
+        optional = {
+            "required-check": ("ci", "string"),
+            "ai-review-check": ("ai-review", "string"),
+            "low-risk-label": ("risk:low", "string"),
+            "high-risk-label": ("risk:high", "string"),
+            "allowed-authors": ("", "string"),
+            "agent-bot-id": ("", "string"),
+            "actions-app-id": ("15368", "string"),
+            "ai-review-actions-app-id": ("15368", "string"),
+            "base-branch": ("main", "string"),
+            "protected-paths": ("", "string"),
+        }
+        require(set(declared) == required | set(optional), "reviewed automerge inputs only")
+        for name in required:
+            field = declared[name]
+            require(field.get("type") == "string" and field.get("required") is True and "default" not in field,
+                    "required string inputs without defaults")
+        for name, (default, kind_name) in optional.items():
+            field = declared[name]
+            require(field.get("type") == kind_name and not field.get("required") and field.get("default") == default,
+                    "optional automerge input default: " + name)
+        gate_ref = declared["gate-ref"]
+        require("workflow_sha" not in repr(declared), "gate-ref must not default to workflow_sha")
+        job = jobs["gate"]
+        require(job.get("permissions") == {"checks": "read", "contents": "read"} and "needs" not in job and "if" not in job,
+                "gate job token reads checks and gate scripts; always runs")
+        require(job.get("environment") == {"name": "production", "deployment": False},
+                "the App key stays behind the production environment")
+        steps = job.get("steps", [])
+        plan = steps[0] if steps else {}
+        expected_plan = {
+            "CLIENT_ID": "${{ inputs.client-id }}",
+            "GATE_REF": "${{ inputs.gate-ref }}",
+            "PR_NUMBER": "${{ inputs.pr-number }}",
+            "REQUIRED_CHECK": "${{ inputs.required-check }}",
+            "AI_REVIEW_CHECK": "${{ inputs.ai-review-check }}",
+            "LOW_RISK_LABEL": "${{ inputs.low-risk-label }}",
+            "HIGH_RISK_LABEL": "${{ inputs.high-risk-label }}",
+            "PROTECTED_PATHS": "${{ inputs.protected-paths }}",
+            "ALLOWED_AUTHORS": "${{ inputs.allowed-authors }}",
+            "AGENT_BOT_ID": "${{ inputs.agent-bot-id }}",
+            "ACTIONS_APP_ID": "${{ inputs.actions-app-id }}",
+            "AI_REVIEW_ACTIONS_APP_ID": "${{ inputs.ai-review-actions-app-id }}",
+            "BASE_BRANCH": "${{ inputs.base-branch }}",
+        }
+        require(plan.get("id") == "plan" and plan.get("env") == expected_plan,
+                "validation must read every input through env in the plan step")
+        for step in steps[1:]:
+            require("inputs." not in repr(step), "raw inputs may only enter the validation step through env")
+        checkout = next((s for s in steps if s.get("uses", "").startswith("actions/checkout@")), None)
+        require(checkout is not None and checkout.get("with", {}).get("repository") == "verbanium-lab/.github"
+                and checkout.get("with", {}).get("ref") == "${{ steps.plan.outputs.gate-ref }}"
+                and "risk_low_automerge.py" in checkout.get("with", {}).get("sparse-checkout", ""),
+                "gate scripts sparse checkout required")
+        plan_run = plan.get("run", "")
+        require('"$GATE_REF" =~ ^[0-9a-f]{40}$' in plan_run, "gate-ref sha validation required in plan")
+        require("gate-ref=$GATE_REF" in plan_run, "gate-ref plan output required")
+        token = next((s for s in steps if s.get("uses", "").startswith("actions/create-github-app-token@")), None)
+        require(token is not None and token.get("with", {}).get("permission-contents") == "read"
+                and token.get("with", {}).get("permission-pull-requests") == "write",
+                "App token scoped to read contents and write pull requests")
+        run = " ".join(s.get("run", "") for s in steps)
+        for needle in (
+            "from risk_low_automerge import decide",
+            "neutralize_actions_log_text",
+            "paths_from_pr_files",
+            '["gh", "pr", "merge"',
+            '"--auto"',
+            '"--squash"',
+            '"--match-head-commit"',
+            '"--disable-auto"',
+            "::error::PR #",
+            "disable-auto failed",
+            "HIGH_RISK_LABEL",
+            "LOW_RISK_LABEL",
+            "AI_REVIEW_CHECK",
+            "AI_REVIEW_ACTIONS_APP_ID",
+        ):
+            require(needle in run, "automerge guard required: " + needle)
+        require("pulls/{number}/merge" not in run and "merge_method=squash" not in run and "--admin" not in run,
+                "platform auto-merge only; no direct REST merge or admin")
+        require("release-please--branches--main" not in run, "release PR merge boundary must not overlap")
+        script = (Path(__file__).resolve().parent / "risk_low_automerge.py").read_text(encoding="utf-8")
+        for needle in ("MINIMUM_PROTECTED_PATTERNS", ".github/**", "pnpm-lock.yaml", "Dockerfile*"):
+            require(needle in script, "minimum protected paths baked into gate script: " + needle)
+        gate_step = steps[-1]
+        require(gate_step.get("env") == {"GH_TOKEN": "${{ steps.app.outputs.token }}", "CHECKS_TOKEN": "${{ github.token }}"}
+                or set(gate_step.get("env", {})) >= {"GH_TOKEN", "CHECKS_TOKEN"},
+                "App token for merge, job token only for reading checks")
     elif kind == "status":
+
         require(set(jobs) == {"status"}, "one status job required")
         require(not call.get("secrets"), "status workflow must not accept secrets")
         declared = call.get("inputs", {})
@@ -559,6 +660,7 @@ def main():
         validate_reusable(load_yaml(root / ".github/workflows/deploy-coolify.yml"), "deploy")
         validate_reusable(load_yaml(root / ".github/workflows/status.yml"), "status")
         validate_reusable(load_yaml(root / ".github/workflows/release-pr-merge.yml"), "merge")
+        validate_reusable(load_yaml(root / ".github/workflows/risk-low-automerge.yml"), "automerge")
         if args.snapshot:
             for path in paths:
                 target = args.snapshot / path
