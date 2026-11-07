@@ -738,10 +738,20 @@ Guards (all configurable through inputs; defaults shown):
 
 - label `risk:low` present and label `risk:high` absent;
 - not a draft; base branch matches `base-branch` (default `main`); head branch in the same repository;
-- author matches `agent-author-regex` with user type `Bot`, or appears in `allowed-authors`;
-- no changed file matches a glob in `protected-paths` (default includes workflows, CODEOWNERS, sops, secrets);
-- GitHub Actions check runs named `required-check` (default `ci`) and `ai-review-check` (default
-  `ai-review`) completed successfully on the PR head (`actions-app-id`, default `15368`).
+- author is the configured `agent-bot-id` (numeric GitHub user id; empty denies all bots), or appears in
+  `allowed-authors` as `login|Type` pairs matched on both fields;
+- changed paths include current and previous filenames (renames and deletions); if the files API list
+  reaches 3000 entries or the changed-file count is unknown, the gate refuses auto-merge;
+- no changed path matches a glob in `protected-paths` (defaults include workflows, CODEOWNERS,
+  `**/.sops.yaml`, `**/secrets/**`);
+- the latest GitHub Actions check run per name (by `started_at` and `id`) for `required-check`
+  (default `ci`, `actions-app-id` default `15368`) and `ai-review-check` (default `ai-review`,
+  `ai-review-actions-app-id` default `15368` for non-Actions reviewers) completed successfully on the
+  pinned PR head.
+
+When guards pass, the workflow enables squash auto-merge with `gh pr merge --match-head-commit` on the
+PR head SHA decided at evaluation time. A new push needs a fresh gate run. When guards fail, it runs
+`gh pr merge --disable-auto` idempotently and records that in the job summary.
 
 Pin by reviewed commit. The job uses the caller `production` environment and organization secret
 `VERBANIUM_CI_PRIVATE_KEY`; checks are read with the job token, auto-merge is requested with the App token.
@@ -768,6 +778,7 @@ jobs:
        github.event.workflow_run.head_repository.full_name == github.repository)
     permissions:
       checks: read
+      contents: read
     uses: verbanium-lab/.github/.github/workflows/risk-low-automerge.yml@REVIEWED_WORKFLOW_COMMIT
     secrets:
       VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
@@ -776,12 +787,15 @@ jobs:
       pr-number: >-
         ${{ github.event_name == 'pull_request' && github.event.pull_request.number ||
             github.event.workflow_run.pull_requests[0].number }}
+      agent-bot-id: "341351550"
       protected-paths: |
         .github/workflows/**
         .github/CODEOWNERS
         **/.sops.yaml
+        **/secrets/**
 ```
 
 Re-run on `workflow_run` after `CI` completes so the required check and `ai-review-check` are green on
-the current head. Offline tests cover `risk_low_automerge.decide`; they do not prove live auto-merge
-or ruleset behavior on the caller repository.
+the current head. Pin `agent-bot-id` to the dispatch agent's numeric user id. Offline tests cover
+`risk_low_automerge` path matching, renamed files, check-run selection and `decide`; they do not prove
+live auto-merge or ruleset behavior on the caller repository.

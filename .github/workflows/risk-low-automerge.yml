@@ -2,6 +2,9 @@
 # The owner still approves in review; this workflow only turns on GitHub auto-merge when every
 # guard passes. risk:high and unlabeled pull requests never qualify.
 #
+# Head SHA is pinned for gh pr merge --match-head-commit. A new push to the PR requires a fresh
+# gate run before auto-merge applies to that commit.
+#
 # Callers pin this file by reviewed commit and pass every policy knob through inputs (no embedded
 # reviewer or model names). The AI review check name is an input (default ai-review); the check
 # itself is produced elsewhere (engine-apps#26).
@@ -46,15 +49,19 @@ on:
           **/secrets/**
         type: string
       allowed-authors:
-        description: Comma-separated extra author logins allowed besides agent bot accounts
+        description: Comma-separated login|Type pairs allowed besides the configured agent bot id
         default: ""
         type: string
-      agent-author-regex:
-        description: Full-match regex for bot agent authors (type Bot)
-        default: .*\[bot\]$
+      agent-bot-id:
+        description: Numeric GitHub user id of the allowed agent bot (empty denies all bots)
+        default: ""
         type: string
       actions-app-id:
-        description: GitHub App id for Actions check runs trusted by the caller ruleset
+        description: GitHub App id for required CI check runs
+        default: "15368"
+        type: string
+      ai-review-actions-app-id:
+        description: GitHub App id for the AI review check (defaults to actions-app-id when empty)
         default: "15368"
         type: string
       base-branch:
@@ -78,6 +85,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       checks: read
+      contents: read
     environment:
       name: production
       deployment: false
@@ -93,14 +101,16 @@ jobs:
           HIGH_RISK_LABEL: ${{ inputs.high-risk-label }}
           PROTECTED_PATHS: ${{ inputs.protected-paths }}
           ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
-          AGENT_AUTHOR_REGEX: ${{ inputs.agent-author-regex }}
+          AGENT_BOT_ID: ${{ inputs.agent-bot-id }}
           ACTIONS_APP_ID: ${{ inputs.actions-app-id }}
+          AI_REVIEW_ACTIONS_APP_ID: ${{ inputs.ai-review-actions-app-id }}
           BASE_BRANCH: ${{ inputs.base-branch }}
         run: |
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::pr-number must be digits"; exit 1; }
           [[ "$CLIENT_ID" =~ ^Iv[0-9A-Za-z.]{10,40}$ ]] || { echo "::error::invalid client-id"; exit 1; }
-          [[ "$AGENT_AUTHOR_REGEX" != "" ]] || { echo "::error::agent-author-regex must not be empty"; exit 1; }
+          [[ "$AGENT_BOT_ID" == "" || "$AGENT_BOT_ID" =~ ^[0-9]+$ ]] || { echo "::error::agent-bot-id must be digits or empty"; exit 1; }
           [[ "$ACTIONS_APP_ID" =~ ^[0-9]+$ ]] || { echo "::error::actions-app-id must be digits"; exit 1; }
+          [[ "$AI_REVIEW_ACTIONS_APP_ID" =~ ^[0-9]+$ ]] || { echo "::error::ai-review-actions-app-id must be digits"; exit 1; }
           {
             echo "client-id=$CLIENT_ID"
             echo "pr-number=$PR_NUMBER"
@@ -108,10 +118,13 @@ jobs:
             echo "ai-review-check=$AI_REVIEW_CHECK"
             echo "low-risk-label=$LOW_RISK_LABEL"
             echo "high-risk-label=$HIGH_RISK_LABEL"
-            echo "allowed-authors=$ALLOWED_AUTHORS"
-            echo "agent-author-regex=$AGENT_AUTHOR_REGEX"
+            echo "agent-bot-id=$AGENT_BOT_ID"
             echo "actions-app-id=$ACTIONS_APP_ID"
+            echo "ai-review-actions-app-id=$AI_REVIEW_ACTIONS_APP_ID"
             echo "base-branch=$BASE_BRANCH"
+            echo "allowed-authors<<GATE_AUTHORS"
+            printf '%s\n' "$ALLOWED_AUTHORS"
+            echo GATE_AUTHORS
             echo "protected-paths<<GATE_PATHS"
             printf '%s\n' "$PROTECTED_PATHS"
             echo GATE_PATHS
@@ -120,7 +133,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: verbanium-lab/.github
-          ref: ${{ github.action_ref }}
+          ref: ${{ github.workflow_sha }}
           path: _github-defaults
           persist-credentials: false
           sparse-checkout: .github/scripts/risk_low_automerge.py
@@ -144,15 +157,17 @@ jobs:
           HIGH_RISK_LABEL: ${{ steps.plan.outputs.high-risk-label }}
           PROTECTED_PATHS: ${{ steps.plan.outputs.protected-paths }}
           ALLOWED_AUTHORS: ${{ steps.plan.outputs.allowed-authors }}
-          AGENT_AUTHOR_REGEX: ${{ steps.plan.outputs.agent-author-regex }}
+          AGENT_BOT_ID: ${{ steps.plan.outputs.agent-bot-id }}
           ACTIONS_APP_ID: ${{ steps.plan.outputs.actions-app-id }}
+          AI_REVIEW_ACTIONS_APP_ID: ${{ steps.plan.outputs.ai-review-actions-app-id }}
           BASE_BRANCH: ${{ steps.plan.outputs.base-branch }}
         run: |
           python3 - <<'PY'
           import json, os, subprocess, sys
 
           sys.path.insert(0, "_github-defaults/.github/scripts")
-          from risk_low_automerge import decide, parse_list, parse_patterns
+          from risk_low_automerge import decide, parse_agent_bot_id, parse_allowed_authors, parse_patterns
+          from risk_low_automerge import paths_from_pr_files, pr_files_inventory_ok
 
           repo = os.environ["REPO"]
           number = os.environ["PR_NUMBER"]
@@ -188,38 +203,65 @@ jobs:
           labels = api_items(f"repos/{repo}/issues/{number}/labels?per_page=100")
           label_names = {item["name"] for item in labels}
           files = api_items(f"repos/{repo}/pulls/{number}/files?per_page=100")
-          changed = [item["filename"] for item in files]
+          changed_files_ok, changed_files_detail = pr_files_inventory_ok(
+              file_count=pr.get("changed_files"),
+              listed_count=len(files),
+          )
+          changed = paths_from_pr_files(files)
           check_pages = pages(
               f"repos/{repo}/commits/{sha}/check-runs?per_page=100",
               os.environ["CHECKS_TOKEN"],
           )
           check_runs = [run for page in check_pages for run in page.get("check_runs", [])]
           head_repo = (pr.get("head") or {}).get("repo") or {}
+          author = pr.get("user") or {}
+          agent_bot_id = parse_agent_bot_id(os.environ["AGENT_BOT_ID"])
           decision = decide(
               label_names=frozenset(label_names),
               draft=bool(pr.get("draft")),
-              author_login=(pr.get("user") or {}).get("login", ""),
-              author_type=(pr.get("user") or {}).get("type", ""),
+              author_login=author.get("login", ""),
+              author_type=author.get("type", ""),
+              author_id=int(author.get("id") or 0),
               base_branch=os.environ["BASE_BRANCH"],
               pr_base=pr.get("base", {}).get("ref", ""),
               head_repo_full_name=head_repo.get("full_name", ""),
               caller_repo=repo,
               changed_files=tuple(changed),
+              changed_files_ok=changed_files_ok,
+              changed_files_detail=changed_files_detail,
               check_runs=tuple(check_runs),
               low_risk_label=os.environ["LOW_RISK_LABEL"],
               high_risk_label=os.environ["HIGH_RISK_LABEL"],
               protected_patterns=parse_patterns(os.environ["PROTECTED_PATHS"]),
-              allowed_authors=parse_list(os.environ["ALLOWED_AUTHORS"]),
-              agent_author_regex=os.environ["AGENT_AUTHOR_REGEX"],
+              allowed_authors=parse_allowed_authors(os.environ["ALLOWED_AUTHORS"]),
+              agent_bot_id=agent_bot_id,
               required_check=os.environ["REQUIRED_CHECK"],
               ai_review_check=os.environ["AI_REVIEW_CHECK"],
               actions_app_id=int(os.environ["ACTIONS_APP_ID"]),
+              ai_review_actions_app_id=int(os.environ["AI_REVIEW_ACTIONS_APP_ID"]),
           )
           if not decision.enable_auto_merge:
-              say(f"::notice::PR #{number}: auto-merge not enabled — " + "; ".join(decision.reasons))
+              say(
+                  f"::notice::PR #{number} ({sha[:7]}): auto-merge not enabled — "
+                  + "; ".join(decision.reasons)
+              )
+              disabled = subprocess.run(
+                  ["gh", "pr", "merge", number, "--disable-auto", "--repo", repo],
+                  capture_output=True,
+                  text=True,
+              )
+              if disabled.returncode == 0:
+                  say(f"PR #{number}: disabled auto-merge (idempotent when already off).")
+              elif "not enabled" in (disabled.stderr or disabled.stdout or "").lower():
+                  say(f"PR #{number}: auto-merge was not enabled.")
+              else:
+                  say(
+                      f"::warning::PR #{number}: gh pr merge --disable-auto: "
+                      + (disabled.stderr.strip() or disabled.stdout.strip())
+                  )
               sys.exit(0)
           merged = subprocess.run(
-              ["gh", "pr", "merge", number, "--auto", "--squash", "--repo", repo],
+              ["gh", "pr", "merge", number, "--auto", "--squash", "--match-head-commit", sha, "--repo", repo],
               capture_output=True,
               text=True,
           )
@@ -229,5 +271,8 @@ jobs:
                   + (merged.stderr.strip() or merged.stdout.strip())
               )
               sys.exit(1)
-          say(f"PR #{number} ({sha[:7]}): enabled squash auto-merge after gate checks passed.")
+          say(
+              f"PR #{number} ({sha[:7]}): enabled squash auto-merge after gate checks passed "
+              f"(pinned head {sha[:7]}; a new push needs a fresh gate run)."
+          )
           PY

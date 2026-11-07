@@ -506,8 +506,9 @@ def validate_reusable(workflow, kind):
             "low-risk-label": ("risk:low", "string"),
             "high-risk-label": ("risk:high", "string"),
             "allowed-authors": ("", "string"),
-            "agent-author-regex": (r".*\[bot\]$", "string"),
+            "agent-bot-id": ("", "string"),
             "actions-app-id": ("15368", "string"),
+            "ai-review-actions-app-id": ("15368", "string"),
             "base-branch": ("main", "string"),
         }
         require(set(declared) == required | set(optional) | {"protected-paths"}, "reviewed automerge inputs only")
@@ -522,10 +523,11 @@ def validate_reusable(workflow, kind):
         protected = declared["protected-paths"]
         require(protected.get("type") == "string" and not protected.get("required")
                 and ".github/workflows" in protected.get("default", "")
-                and "CODEOWNERS" in protected.get("default", ""), "protected-paths default boundary")
+                and "CODEOWNERS" in protected.get("default", "")
+                and "**/secrets/**" in protected.get("default", ""), "protected-paths default boundary")
         job = jobs["gate"]
-        require(job.get("permissions") == {"checks": "read"} and "needs" not in job and "if" not in job,
-                "gate job token reads checks only and always runs")
+        require(job.get("permissions") == {"checks": "read", "contents": "read"} and "needs" not in job and "if" not in job,
+                "gate job token reads checks and gate scripts; always runs")
         require(job.get("environment") == {"name": "production", "deployment": False},
                 "the App key stays behind the production environment")
         steps = job.get("steps", [])
@@ -539,8 +541,9 @@ def validate_reusable(workflow, kind):
             "HIGH_RISK_LABEL": "${{ inputs.high-risk-label }}",
             "PROTECTED_PATHS": "${{ inputs.protected-paths }}",
             "ALLOWED_AUTHORS": "${{ inputs.allowed-authors }}",
-            "AGENT_AUTHOR_REGEX": "${{ inputs.agent-author-regex }}",
+            "AGENT_BOT_ID": "${{ inputs.agent-bot-id }}",
             "ACTIONS_APP_ID": "${{ inputs.actions-app-id }}",
+            "AI_REVIEW_ACTIONS_APP_ID": "${{ inputs.ai-review-actions-app-id }}",
             "BASE_BRANCH": "${{ inputs.base-branch }}",
         }
         require(plan.get("id") == "plan" and plan.get("env") == expected_plan,
@@ -549,6 +552,7 @@ def validate_reusable(workflow, kind):
             require("inputs." not in repr(step), "raw inputs may only enter the validation step through env")
         checkout = next((s for s in steps if s.get("uses", "").startswith("actions/checkout@")), None)
         require(checkout is not None and checkout.get("with", {}).get("repository") == "verbanium-lab/.github"
+                and checkout.get("with", {}).get("ref") == "${{ github.workflow_sha }}"
                 and "risk_low_automerge.py" in checkout.get("with", {}).get("sparse-checkout", ""),
                 "gate scripts sparse checkout required")
         token = next((s for s in steps if s.get("uses", "").startswith("actions/create-github-app-token@")), None)
@@ -556,8 +560,19 @@ def validate_reusable(workflow, kind):
                 and token.get("with", {}).get("permission-pull-requests") == "write",
                 "App token scoped to read contents and write pull requests")
         run = " ".join(s.get("run", "") for s in steps)
-        for needle in ("from risk_low_automerge import decide", '["gh", "pr", "merge"', '"--auto"', '"--squash"',
-                       "HIGH_RISK_LABEL", "LOW_RISK_LABEL", "AI_REVIEW_CHECK"):
+        for needle in (
+            "from risk_low_automerge import decide",
+            "paths_from_pr_files",
+            '["gh", "pr", "merge"',
+            '"--auto"',
+            '"--squash"',
+            '"--match-head-commit"',
+            '"--disable-auto"',
+            "HIGH_RISK_LABEL",
+            "LOW_RISK_LABEL",
+            "AI_REVIEW_CHECK",
+            "AI_REVIEW_ACTIONS_APP_ID",
+        ):
             require(needle in run, "automerge guard required: " + needle)
         require("pulls/{number}/merge" not in run and "merge_method=squash" not in run and "--admin" not in run,
                 "platform auto-merge only; no direct REST merge or admin")
