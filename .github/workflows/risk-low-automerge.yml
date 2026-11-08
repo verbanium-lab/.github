@@ -154,7 +154,7 @@ jobs:
         with:
           client-id: ${{ steps.plan.outputs.client-id }}
           private-key: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
-          permission-contents: read
+          permission-contents: write
           permission-pull-requests: write
       - name: Evaluate pull request and enable auto-merge
         env:

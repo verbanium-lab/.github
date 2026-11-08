@@ -558,9 +558,9 @@ def validate_reusable(workflow, kind):
         require('"$GATE_REF" =~ ^[0-9a-f]{40}$' in plan_run, "gate-ref sha validation required in plan")
         require("gate-ref=$GATE_REF" in plan_run, "gate-ref plan output required")
         token = next((s for s in steps if s.get("uses", "").startswith("actions/create-github-app-token@")), None)
-        require(token is not None and token.get("with", {}).get("permission-contents") == "read"
+        require(token is not None and token.get("with", {}).get("permission-contents") == "write"
                 and token.get("with", {}).get("permission-pull-requests") == "write",
-                "App token scoped to read contents and write pull requests")
+                "App token scoped to write contents and pull requests (auto-merge GraphQL)")
         run = " ".join(s.get("run", "") for s in steps)
         for needle in (
             "from risk_low_automerge import decide",
