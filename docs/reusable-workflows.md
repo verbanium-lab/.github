@@ -530,9 +530,16 @@ Caller repositories that publish releases and move `deployed-*` tags can refresh
 `README.md` between `<!-- status:start -->` and `<!-- status:end -->`. The reusable
 `.github/workflows/status.yml` workflow:
 
-- Reads the latest GitHub Release per app slug (name prefix `<slug>-`), resolves `deployed-prod` and
-  `deployed-rc` digests from GHCR, and links each digest to the release whose body contains the
-  matching ``Deploy by digest: `<image>@sha256:…` `` line (otherwise shows a short digest).
+- Reads the latest GitHub Release by `published_at` per exact app slug. Accepted tags are
+  `<slug>-YYYY.MM.DD-<sha7>` and `<slug>-vMAJOR.MINOR.PATCH`, with optional SemVer prerelease
+  (`-rc.1`) and build metadata (`+build.1`). A longer slug such as `iblonda-web-admin` does not
+  match `iblonda-web`.
+- Resolves `deployed-prod` and `deployed-rc` digests from GHCR, and links each digest to the release
+  whose body contains the matching ``Deploy by digest: `<image>@sha256:…` `` line. Otherwise it
+  shows a short digest. The iblonda-apps release-please workflow does not add this line, its
+  deployed-tag caller passes no release, and the shared deployed-tag workflow's optional `release`
+  metadata accepts only legacy tags. SemVer deployments therefore keep the short digest unless
+  their release body explicitly records the image and digest; no mapping is inferred from versions.
 - Optionally merges a downloaded artifact's `coverage.json` (`slug` → `{unit, e2e}` URL objects) into
   the Coverage column.
 - Inserts the native CI badge line when it is absent inside the block. When the block changed, it

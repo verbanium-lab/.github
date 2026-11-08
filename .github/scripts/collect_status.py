@@ -13,7 +13,15 @@ from urllib.request import Request, urlopen
 APP_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 IMAGE_RE = re.compile(r"^ghcr\.io/verbanium-lab/[a-z0-9]+(?:[._/-][a-z0-9]+)*$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-RELEASE_TAG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}-\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7}$")
+SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
+SEMVER_PRERELEASE = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+RELEASE_TAG_RE = re.compile(
+    r"^(?P<slug>[a-z0-9][a-z0-9_-]{0,62})-(?:"
+    r"[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{7}"
+    rf"|v{SEMVER_NUMBER}\.{SEMVER_NUMBER}\.{SEMVER_NUMBER}"
+    rf"(?:-{SEMVER_PRERELEASE}(?:\.{SEMVER_PRERELEASE})*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$"
+)
 DEPLOY_LINE = re.compile(r"Deploy by digest: `([^`]+)`")
 
 
@@ -95,11 +103,11 @@ def digest_cell(releases: list[dict], image: str, digest: str | None, server: st
 
 
 def latest_release_for_slug(releases: list[dict], slug: str, server: str, repository: str) -> dict | None:
-    prefix = slug + "-"
     candidates = []
     for release in releases:
         tag = release.get("tag_name") or ""
-        if tag.startswith(prefix) and RELEASE_TAG_RE.fullmatch(tag):
+        match = RELEASE_TAG_RE.fullmatch(tag)
+        if match and match.group("slug") == slug:
             candidates.append(release)
     if not candidates:
         return None
