@@ -789,12 +789,13 @@ required. The gate still requires both `required-check` (default `ci`) and `ai-r
 
 ### App token permissions (auto-merge)
 
-The workflow mints a verbanium-ci installation token with `permission-contents: read` and
+The workflow mints a verbanium-ci installation token with `permission-contents: write` and
 `permission-pull-requests: write`, then calls `gh pr merge --auto` and `gh pr merge --disable-auto`.
-**Not verified offline:** whether GraphQL `enablePullRequestAutoMerge` needs additional repository
-permissions beyond `pull_requests: write` (some docs mention `contents: write` for merge queue flows).
-Treat `pull_requests: write` as the minimum documented scope; confirm on the first live caller run and
-record evidence before widening.
+**Verified on the first live caller run (engine-apps#32):** with `permission-contents: read` the
+GraphQL mutation `disablePullRequestAutoMerge` fails with "Resource not accessible by integration",
+so the auto-merge mutations need `contents: write` as well. The App already holds that permission
+(`release-pr-merge` uses it). The job token for reading checks stays `checks: read`; the gate
+executes no pull request code.
 
 ### Guards
 
