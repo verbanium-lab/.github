@@ -322,13 +322,16 @@ class DefaultsTests(unittest.TestCase):
         self.assertIsNone(validator.validate_reusable(self.reusable('automerge'), 'automerge'))
         def strip_auto(w):
             step = w['jobs']['gate']['steps'][-1]
-            step['run'] = step['run'].replace('"--auto"', '')
+            step['run'] = step['run'].replace('"merge_method=squash"', '')
+        def strip_veto(w):
+            step = w['jobs']['gate']['steps'][-1]
+            step['run'] = step['run'].replace('CHANGES_REQUESTED', '')
         def strip_decide(w):
             step = w['jobs']['gate']['steps'][-1]
             step['run'] = step['run'].replace('from risk_low_automerge import decide', '')
         def add_rest(w):
             step = w['jobs']['gate']['steps'][-1]
-            step['run'] = step['run'] + ' pulls/{number}/merge'
+            step['run'] = step['run'] + ' gh pr merge --auto'
         def bad_gate_ref_checkout(w):
             checkout = next(s for s in w['jobs']['gate']['steps'] if s.get('uses', '').startswith('actions/checkout@'))
             checkout['with']['ref'] = '${{ github.workflow_sha }}'
@@ -340,6 +343,7 @@ class DefaultsTests(unittest.TestCase):
             lambda w: w[True]['workflow_call']['inputs'].pop('gate-ref'),
             bad_gate_ref_checkout,
             strip_auto,
+            strip_veto,
             strip_decide,
             add_rest,
         ):

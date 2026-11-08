@@ -729,10 +729,14 @@ behind the environment branch rule, and this workflow checks the PR shape before
 
 ## Risk low auto-merge
 
-`.github/workflows/risk-low-automerge.yml` enables GitHub platform auto-merge (`gh pr merge --auto
---squash`) only when every guard passes on the pull request identified by `pr-number`. Unlabeled pull
-requests and those with `risk:high` never qualify. The owner still approves; this workflow does not
-change branch protection or organization rulesets.
+`.github/workflows/risk-low-automerge.yml` merges the pull request identified by `pr-number` directly
+(REST squash merge pinned to the evaluated head SHA) only when every guard passes. Unlabeled pull
+requests and those with `risk:high` never qualify. No human approval is needed for a qualifying pull
+request; a review that requests changes stops the gate (the owner's veto). The merge needs the
+verbanium-ci App to be a bypass actor (pull requests only) of the ruleset's pull request rule: GitHub
+auto-merge does not apply the bypass, which is why the gate does not use it (same reason as
+`release-pr-merge`, .github#37). This workflow does not change branch protection or organization
+rulesets.
 
 ### Pinning `gate-ref` and the reusable workflow
 
@@ -763,15 +767,15 @@ execute code from the pull request head. Triggers on `pull_request_target`:
 
 `labeled`, `unlabeled`, `synchronize`, `ready_for_review`, `converted_to_draft`, `edited`, `reopened`
 
-Removing `risk:low` or converting to draft re-runs the gate, which disables auto-merge when guards fail.
+Removing `risk:low` or converting to draft re-runs the gate, which then does not merge.
 
 ### Required checks and advisory AI review
 
 Configure the caller ruleset so this gate job's check name (for example `Risk low auto-merge / gate`) is
-**required** on pull requests that may use platform auto-merge. The organization `ai-review` check is
+**required** on pull requests that may be merged by the gate. The organization `ai-review` check is
 **advisory-only** in branch rules on its own: it does not block merge unless the owner also lists it as
 required. The gate still requires both `required-check` (default `ci`) and `ai-review-check` (default
-`ai-review`) to be green on the pinned head before enabling auto-merge.
+`ai-review`) to be green on the pinned head before merging.
 
 ### Trust model: what the gate does not prove
 
@@ -782,18 +786,20 @@ required. The gate still requires both `required-check` (default `ci`) and `ai-r
 - **Check names can be forged by anything that runs PR code with `checks: write`.** CI jobs that execute
   PR code must not have `checks: write`; set `ai-review-app-id` to the real app that publishes the
   reviewer check (do not leave it on the GitHub Actions default once the reviewer is its own app).
-- **Auto-merge stays enabled after a push until the gate runs again.** `--match-head-commit` pins the
-  moment of enabling only. Keep the gate as a required check in the ruleset so a merge cannot complete
-  before it has run on the new head, and use the `concurrency` group in the caller example so older runs
-  never enable auto-merge after a later run disabled it.
+- **The merge is pinned to the evaluated head.** The REST merge sends `sha=<head>`; if a push moved
+  the head after evaluation, GitHub refuses and the next gate run decides again. Use the `concurrency`
+  group in the caller example so runs for one pull request do not overlap.
+- **No human approves a `risk:low` pull request.** The label is the agent's own assessment, so the
+  remaining controls are the protected paths, the author check, green `ci` and `ai-review`, and the
+  owner's veto (a review that requests changes). Review threads are not checked by the gate.
 
-### App token permissions (auto-merge)
+### App token permissions (merge)
 
 The workflow mints a verbanium-ci installation token with `permission-contents: write` and
-`permission-pull-requests: write`, then calls `gh pr merge --auto` and `gh pr merge --disable-auto`.
+`permission-pull-requests: write`, then calls the REST merge endpoint.
 **Verified on the first live caller run (engine-apps#32):** with `permission-contents: read` the
-GraphQL mutation `disablePullRequestAutoMerge` fails with "Resource not accessible by integration",
-so the auto-merge mutations need `contents: write` as well. The App already holds that permission
+GraphQL auto-merge mutation fails with "Resource not accessible by integration"; merging needs
+`contents: write`. The App already holds that permission
 (`release-pr-merge` uses it). The job token for reading checks stays `checks: read`; the gate
 executes no pull request code.
 
@@ -816,14 +822,14 @@ Baked-in minimum protected paths (always enforced): `.github/**`, `**/CODEOWNERS
 `justfile`, `lefthook.yml`, `**/.sops.yaml`, `**/secrets/**`, `package.json`, `pnpm-lock.yaml`,
 `pnpm-workspace.yaml`, `Dockerfile*`, `**/Dockerfile*`.
 
-When guards pass, the workflow enables squash auto-merge with `gh pr merge --match-head-commit` on the
-PR head SHA decided at evaluation time. A new push needs a fresh gate run. When guards fail, it runs
-`gh pr merge --disable-auto` idempotently; failures other than “auto-merge is not enabled” fail the job.
+When guards pass and no review requests changes, the workflow squash-merges with the REST endpoint on
+the PR head SHA decided at evaluation time. A new push needs a fresh gate run. When guards fail, it
+only writes a notice and merges nothing; a refused merge fails the job.
 PR file names and API error text are neutralized before `::notice::` / `::error::` and the job summary.
 
 Pin the reusable workflow by reviewed commit. The job uses the caller `production` environment and
 organization secret `VERBANIUM_CI_PRIVATE_KEY`; checks are read with the job token, auto-merge is
-requested with the App token.
+performed with the App token.
 
 ### Caller example
 

@@ -1,9 +1,9 @@
-# Enables platform auto-merge (squash) for caller pull requests that satisfy the risk:low gate.
-# The owner still approves in review; this workflow only turns on GitHub auto-merge when every
-# guard passes. risk:high and unlabeled pull requests never qualify.
+# Merges (squash, directly) caller pull requests that satisfy the risk:low gate. No human approval
+# is needed for them; a requested-changes review is the owner's veto. risk:high and unlabeled
+# pull requests never qualify.
 #
-# Head SHA is pinned for gh pr merge --match-head-commit. A new push to the PR requires a fresh
-# gate run before auto-merge applies to that commit.
+# The merge is pinned to the evaluated head SHA (the API refuses if the head moved). A new push
+# to the PR requires a fresh gate run before it can merge.
 #
 # Callers pin this workflow by reviewed commit and pass gate-ref (verbanium-lab/.github script SHA)
 # plus every policy knob through inputs. The AI review check name is an input (default ai-review);
@@ -255,26 +255,23 @@ jobs:
           safe_reasons = "; ".join(neutralize_actions_log_text(r) for r in decision.reasons)
           if not decision.enable_auto_merge:
               say(
-                  f"::notice::PR #{number} ({sha[:7]}): auto-merge not enabled — " + safe_reasons
+                  f"::notice::PR #{number} ({sha[:7]}): not merged by the gate — " + safe_reasons
               )
-              disabled = subprocess.run(
-                  ["gh", "pr", "merge", number, "--disable-auto", "--repo", repo],
-                  capture_output=True,
-                  text=True,
-              )
-              if disabled.returncode == 0:
-                  say(f"PR #{number}: disabled auto-merge (idempotent when already off).")
-              elif "not enabled" in (disabled.stderr or disabled.stdout or "").lower():
-                  say(f"PR #{number}: auto-merge was not enabled.")
-              else:
-                  detail = neutralize_actions_log_text(
-                      (disabled.stderr or disabled.stdout or "").strip()
-                  )
-                  say(f"::error::PR #{number}: gh pr merge --disable-auto failed: " + detail)
-                  sys.exit(1)
               sys.exit(0)
+          # Human veto: a requested-changes review from anyone stops the gate.
+          reviews = api_items(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
+          latest = {}
+          for review in reviews:
+              if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+                  latest[(review.get("user") or {}).get("login", "")] = review["state"]
+          if "CHANGES_REQUESTED" in latest.values():
+              say(f"::notice::PR #{number} ({sha[:7]}): not merged — a review requests changes.")
+              sys.exit(0)
+          # GitHub auto-merge does not apply the App's ruleset bypass, so the gate merges
+          # directly, pinned to the evaluated head (the API refuses if the head moved).
           merged = subprocess.run(
-              ["gh", "pr", "merge", number, "--auto", "--squash", "--match-head-commit", sha, "--repo", repo],
+              ["gh", "api", "--method", "PUT", f"repos/{repo}/pulls/{number}/merge",
+               "-f", "merge_method=squash", "-f", f"sha={sha}"],
               capture_output=True,
               text=True,
           )
@@ -282,12 +279,7 @@ jobs:
               detail = neutralize_actions_log_text(
                   (merged.stderr or merged.stdout or "").strip()
               )
-              say(
-                  f"::error::PR #{number} ({sha[:7]}): gh pr merge --auto refused: " + detail
-              )
+              say(f"::error::PR #{number} ({sha[:7]}): merge refused: " + detail)
               sys.exit(1)
-          say(
-              f"PR #{number} ({sha[:7]}): enabled squash auto-merge after gate checks passed "
-              f"(pinned head {sha[:7]}; a new push needs a fresh gate run)."
-          )
+          say(f"PR #{number} ({sha[:7]}): merged (squash) after the risk:low gate passed on that head.")
           PY

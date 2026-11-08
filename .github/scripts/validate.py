@@ -566,21 +566,21 @@ def validate_reusable(workflow, kind):
             "from risk_low_automerge import decide",
             "neutralize_actions_log_text",
             "paths_from_pr_files",
-            '["gh", "pr", "merge"',
-            '"--auto"',
-            '"--squash"',
-            '"--match-head-commit"',
-            '"--disable-auto"',
+            '"--method", "PUT"',
+            "pulls/{number}/merge",
+            '"merge_method=squash"',
+            'f"sha={sha}"',
+            "CHANGES_REQUESTED",
             "::error::PR #",
-            "disable-auto failed",
+            "merge refused",
             "HIGH_RISK_LABEL",
             "LOW_RISK_LABEL",
             "AI_REVIEW_CHECK",
             "AI_REVIEW_ACTIONS_APP_ID",
         ):
             require(needle in run, "automerge guard required: " + needle)
-        require("pulls/{number}/merge" not in run and "merge_method=squash" not in run and "--admin" not in run,
-                "platform auto-merge only; no direct REST merge or admin")
+        require("--auto" not in run and "--admin" not in run and "--disable-auto" not in run,
+                "direct squash merge pinned to the head SHA; no GitHub auto-merge (it ignores the App bypass) or admin")
         require("release-please--branches--main" not in run, "release PR merge boundary must not overlap")
         script = (Path(__file__).resolve().parent / "risk_low_automerge.py").read_text(encoding="utf-8")
         for needle in ("MINIMUM_PROTECTED_PATTERNS", ".github/**", "pnpm-lock.yaml", "Dockerfile*"):
