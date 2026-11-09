@@ -26,10 +26,33 @@ case "$tool/$platform" in
     sha=b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5 ;;
   *) echo 'Unsupported tool or platform' >&2; exit 1 ;;
 esac
+# GitHub release downloads (/releases/download/) can fail for hours with 504 while the REST API
+# still serves the same asset (github.com/orgs/community/discussions/212419, 2026-11-08). On a
+# failed release download, fetch the same asset through the API; the SHA-256 check that follows
+# still decides. GH_TOKEN (the job token) avoids the anonymous API limit of the shared runner IP;
+# curl never forwards it to the redirected storage host.
+download() { # url destination
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --retry 3 --retry-delay 2 --output "$2" "$1" && return 0
+  [[ "$1" =~ ^https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/([^/]+)$ ]] || return 1
+  local api="https://api.github.com/repos/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+  local tag="${BASH_REMATCH[3]}" name="${BASH_REMATCH[4]}" id
+  local auth=()
+  if [ -n "${GH_TOKEN:-}" ]; then auth=(--header "Authorization: Bearer $GH_TOKEN"); fi
+  echo "::warning::Release download failed; fetching $name through the GitHub API." >&2
+  id="$(curl --fail --silent --show-error --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 \
+    ${auth[@]+"${auth[@]}"} --header 'Accept: application/vnd.github+json' "$api/releases/tags/$tag" |
+    python3 -c 'import json, sys
+n = sys.argv[1]
+ids = [a["id"] for a in json.load(sys.stdin).get("assets", []) if a.get("name") == n]
+print(ids[0]) if ids else sys.exit(f"Release asset {n} not found.")' "$name")" ||
+    return 1
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 \
+    ${auth[@]+"${auth[@]}"} --header 'Accept: application/octet-stream' --output "$2" "$api/releases/assets/$id"
+}
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-  --retry 3 --retry-delay 2 --output "$work/archive.tar.gz" "$url"
+download "$url" "$work/archive.tar.gz"
 python3 - "$sha" "$work/archive.tar.gz" <<'PY'
 import hashlib
 from pathlib import Path
