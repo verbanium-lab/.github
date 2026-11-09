@@ -289,8 +289,8 @@ class DefaultsTests(unittest.TestCase):
             lambda w: w['jobs']['tag']['steps'][0].update({'if': '${{ false }}'}),
             lambda w: w['jobs']['tag']['steps'][0]['env'].update(IMAGE='ghcr.io/verbanium-lab/x'),
             lambda w: w['jobs']['tag']['steps'][0]['env'].pop('DIGEST'),
-            lambda w: w['jobs']['tag']['steps'][3]['env'].update(DIGEST='${{ inputs.digest }}'),
-            lambda w: w['jobs']['tag']['steps'][3].update(run='docker pull "$IMAGE@$DIGEST"'),
+            lambda w: w['jobs']['tag']['steps'][4]['env'].update(DIGEST='${{ inputs.digest }}'),
+            lambda w: w['jobs']['tag']['steps'][4].update(run='docker pull "$IMAGE@$DIGEST"'),
             lambda w: w['jobs']['tag']['steps'].insert(0, {'run': 'true'}),
             lambda w: w[True]['workflow_call'].update(secrets={'token': {'required': False}}),
             lambda w: w[True]['workflow_call']['inputs'].pop('env'),
@@ -435,6 +435,53 @@ class NotifyBoundaryTests(unittest.TestCase):
 
 
 class DeployBoundaryTests(unittest.TestCase):
+    def test_shared_retag_boundary_rejections(self):
+        for kind, job_name in [('deploy', 'deploy'), ('deployed', 'tag')]:
+            path = 'deploy-coolify' if kind == 'deploy' else 'deployed-tag'
+            base = validator.load_yaml(ROOT / f'.github/workflows/{path}.yml')
+
+            def step(workflow, name):
+                return next(s for s in workflow['jobs'][job_name]['steps'] if s.get('name') == name)
+
+            for mutate in (
+                lambda w: step(w, 'Check out retag script')['with'].update(ref='${{ github.workflow_sha }}'),
+                lambda w: step(w, 'Check out retag script')['with'].update(repository='${{ github.repository }}'),
+                lambda w: step(w, 'Check out retag script')['with'].update({'sparse-checkout': '.'}),
+                lambda w: step(w, 'Check out retag script')['with'].update({'persist-credentials': True}),
+                lambda w: step(w, 'Retag the deployed digest and verify').update({'if': '${{ always() }}'}),
+                lambda w: step(w, 'Retag the deployed digest and verify').update({'continue-on-error': True}),
+                lambda w: step(w, 'Retag the deployed digest and verify').update(run='docker pull "$IMAGE@$DIGEST"'),
+                lambda w: step(w, 'Retag the deployed digest and verify')['env'].update(TAG='deployed-prod'),
+                lambda w: step(w, 'Log in to GHCR')['env'].update(GH_TOKEN='${{ secrets.EXTRA_TOKEN }}'),
+            ):
+                bad = copy.deepcopy(base)
+                mutate(bad)
+                with self.subTest(kind=kind, workflow=bad), self.assertRaises(validator.Invalid):
+                    validator.validate_reusable(bad, kind)
+
+    def test_deploy_requires_tag_after_live_verification(self):
+        base = validator.load_yaml(ROOT / '.github/workflows/deploy-coolify.yml')
+
+        def retag_first(w):
+            steps = w['jobs']['deploy']['steps']
+            steps.insert(1, steps.pop(next(i for i, s in enumerate(steps) if s.get('name') == 'Retag the deployed digest and verify')))
+
+        for mutate in (
+            retag_first,
+            lambda w: w[True]['workflow_call']['inputs']['env'].update(default='dev'),
+            lambda w: w['jobs']['plan']['outputs'].pop('tag'),
+            lambda w: w['jobs']['deploy'].update({'if': '${{ always() }}'}),
+            lambda w: w['jobs']['deploy']['concurrency'].update(group='unrelated'),
+            lambda w: w['jobs']['plan'].update(permissions={'packages': 'write'}),
+            lambda w: w['jobs']['record'].update(permissions={'packages': 'write'}),
+            lambda w: w['jobs']['deploy']['steps'][2].update({'if': '${{ false }}'}),
+            lambda w: w['jobs']['deploy']['steps'][2].update(run='echo skip verification'),
+        ):
+            bad = copy.deepcopy(base)
+            mutate(bad)
+            with self.subTest(workflow=bad), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(bad, 'deploy')
+
     def test_deploy_rejects_wider_boundaries(self):
         base = validator.load_yaml(ROOT / '.github/workflows/deploy-coolify.yml')
         validator.validate_reusable(copy.deepcopy(base), 'deploy')

@@ -2,7 +2,7 @@
 title: Public organization defaults
 owner: verbanium
 status: active
-last_reviewed: 2026-11-01
+last_reviewed: 2026-11-09
 ---
 
 # .github
@@ -33,7 +33,7 @@ local check and the owner-controlled activation steps.
 | [ghcr-cleanup.yml](.github/workflows/ghcr-cleanup.yml) | Per-package retention with protected release/deployed tags; dry-run by default |
 | [deployed-tag.yml](.github/workflows/deployed-tag.yml) | Moves `deployed-<env>` to the digest that runs in an environment, without pulling layers |
 | [status.yml](.github/workflows/status.yml) | Refreshes the README status table from releases, GHCR deployed tags and optional coverage |
-| [deploy-coolify.yml](.github/workflows/deploy-coolify.yml) | Deploys a main image digest to a Coolify application over an ephemeral tailnet node, records the GitHub Deployment, waits for the live build |
+| [deploy-coolify.yml](.github/workflows/deploy-coolify.yml) | Deploys a main image digest to a Coolify application over an ephemeral tailnet node, records the GitHub Deployment, verifies the live build, protects the digest with `deployed-<env>` |
 | [risk-low-automerge.yml](.github/workflows/risk-low-automerge.yml) | Enables squash auto-merge for `risk:low` agent pull requests when CI, AI review and path guards pass |
 | [release-notify.yml](.github/workflows/release-notify.yml) | Telegram notice for every `<component>-vX.Y.Z` tag that release-please created in the caller |
 | [release.yml](.github/workflows/release.yml) | **Deprecated** (one SemVer scheme, ADR 0009 amendment 2026-11-01 b): date-sha release per main image; no callers left |
@@ -58,11 +58,11 @@ has been running for weeks. `ghcr-cleanup.yml` keeps every `deployed-*` tag, so 
 images (tower, iblonda, landing) may be switched on only after the running digest of each
 environment carries `deployed-<env>` (`dev`, `rc` or `prod`).
 
-Run the tag move right after every Coolify deploy by digest, and again after every rollback (with
-the digest that now runs). Without it, the running digest is protected only while it is among the
-newest ten `sha-*` versions, and it can be deleted later; the next restart or rollback then fails.
+`deploy-coolify.yml` now moves the tag automatically after live commit verification succeeds.
+For other deploy paths and every rollback, run the manual tag move with the digest that now runs.
+Without it, the running digest is protected only while it is among the newest ten `sha-*` versions, and it can be deleted later; the next restart or rollback then fails.
 
-An app repository adds `.github/workflows/deployed-tag.yml`, a manual workflow that calls the
+For manual recovery and rollbacks, an app repository adds `.github/workflows/deployed-tag.yml`, which calls the
 reusable one. Pin the reusable workflow by a reviewed full commit SHA in place of
 `REVIEWED_WORKFLOW_COMMIT`:
 
@@ -107,8 +107,12 @@ See [the guide](docs/reusable-workflows.md#protect-the-deployed-digest).
 
 `deploy-coolify.yml` replaces the deploy jobs copied between repositories (wiki, Studio). Pin it by
 a reviewed full commit SHA and call it after `image.yml` on main pushes; keep it out of the required
-`ci` job, so a failed deploy never blocks merging a fix. The caller grants only `id-token: write`
-and passes at most the verbanium-ci App key: the record and deploy jobs run in the caller's
+`ci` job, so a failed deploy never blocks merging a fix. Update callers to grant `contents: read`,
+`id-token: write` and `packages: write`, then pass `secrets: inherit`. Only the deploy job gets
+package write access; it moves the tag after live verification, within the existing deploy lock.
+The optional `env` input defaults to `prod` for `environment: production`; use `rc` with
+`release-candidate` and `dev` with `dev`. The package must grant the caller repository write access.
+No new secret is needed. The record and deploy jobs run in the caller's
 `production` environment (main-only branch policy) and read its environment secrets
 `TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` there. Recipe and inputs:
 [the guide](docs/reusable-workflows.md#deploy-to-coolify); setting up a new app:

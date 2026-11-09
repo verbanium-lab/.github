@@ -2,7 +2,7 @@
 title: Reusable image builds and registry cleanup
 owner: verbanium
 status: draft
-last_reviewed: 2026-11-01
+last_reviewed: 2026-11-09
 ---
 
 # Reusable image builds and registry cleanup
@@ -443,7 +443,8 @@ Owner decision of 2026-10-28: registry retention for app images (tower, iblonda,
 switched on only after the running digest of each environment carries a `deployed-<env>` tag.
 `ghcr-cleanup.yml` already excludes `deployed-*`; `.github/workflows/deployed-tag.yml` moves the tag.
 
-When to run it: right after every Coolify deploy by digest, and after every rollback, with the
+`deploy-coolify.yml` moves this tag automatically after verifying the live commit. For other deploy
+paths and every rollback, run this manual workflow with the
 digest that now runs. The latest-ten `sha-*` rule protects a digest only while it is recent. An
 environment that stays on one digest for weeks would lose it to the 30-day `sha-*` cleanup, and the
 next restart, scale-out or rollback would fail to pull. A moved tag releases the previous digest
@@ -511,7 +512,9 @@ What the workflow does:
   Payload fields: `image`, `digest`, `release`. A success deployment status is recorded with no
   `environment_url`.
 - Uses only the job's `GITHUB_TOKEN` with `contents: read`, `packages: write` and `deployments: write`;
-  no checkout and no secret. The package must grant the calling repository write access, as for `image.yml`.
+  it checks out only the shared retag script from this reusable workflow's own commit
+  (`job.workflow_sha`), with credentials disabled, and accepts no secret. The package must grant the
+  calling repository write access, as for `image.yml`. Automatic deploys use the same script.
 - Serializes moves per image and environment; a newer waiting request replaces an older waiting one.
 
 Not verified offline: that `imagetools create` from a single index source returns an identical
@@ -593,7 +596,7 @@ amendment 2026-10-28; .github#25). Its three jobs:
 | --- | --- | --- |
 | `plan` | none | Validates every input against the run: main push, `image-tags` is `<image>:sha-<this commit>`, `sha7` is this commit, the digest, the Coolify UUID, https `verbanium.dev` URLs, the environment and the App client ID. Later jobs read only its outputs. |
 | `record` | none (App token) | Creates the GitHub Deployment with the verbanium-ci App in the caller's environment (`deployment: false`). |
-| `deploy` | `id-token: write` | Fails first if a deploy secret is empty, then joins the tailnet as an ephemeral `tag:ci` node (Tailscale workload identity), sets `sha256-<hex>` as the Coolify image tag, deploys, waits up to 10 minutes for Coolify, then up to 5 minutes for `verify-url` to report `sha7`. Deploys of one app and environment queue (`cancel-in-progress: false`). |
+| `deploy` | `contents: read`, `id-token: write`, `packages: write` | Fails first if a deploy secret is empty, then joins the tailnet as an ephemeral `tag:ci` node (Tailscale workload identity), sets `sha256-<hex>` as the Coolify image tag, deploys, waits up to 10 minutes for Coolify, then up to 5 minutes for `verify-url` to report `sha7`. After live verification, moves `deployed-<env>` to the deployed digest and verifies the tag. Deploy and retag share the app/environment lock (`cancel-in-progress: false`). |
 
 `TS_OAUTH_CLIENT_ID`, `TS_AUDIENCE` and `COOLIFY_DEPLOY_TOKEN` are environment secrets of
 `production` (main-only branch policy); the verbanium-ci App key is an environment secret (Studio)
@@ -615,6 +618,7 @@ reviewed `zizmor: ignore[secrets-inherit]`.
 | `verify-url` | yes | Fetched after the deploy until it reports `sha7` |
 | `verify-json-field` | no | JSON field of `verify-url` holding `sha7` (e.g. `sha` for `/healthz`); empty: the page text must contain `sha7` |
 | `environment` | no | `production` (default), `release-candidate` or `dev` |
+| `env` | no | `prod` (default), `rc` or `dev`; must match `environment` as `production`/`prod`, `release-candidate`/`rc`, `dev`/`dev` |
 | `client-id` | yes | `${{ vars.VERBANIUM_CI_CLIENT_ID }}` |
 
 ```yaml
@@ -623,10 +627,13 @@ reviewed `zizmor: ignore[secrets-inherit]`.
     needs: [checks, image-main]
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.checks.outputs.studio == 'true' }}
     permissions:
+      contents: read # Shared retag script at the reusable workflow commit
       id-token: write # Tailscale workload identity in the deploy job
+      packages: write # Protect the digest after live verification
     uses: verbanium-lab/.github/.github/workflows/deploy-coolify.yml@REVIEWED_WORKFLOW_COMMIT
     with:
       app: studio
+      env: prod # Optional for production; required as rc/dev for other environments
       image: ${{ needs.image-main.outputs.image }}
       digest: ${{ needs.image-main.outputs.digest }}
       image-tags: ${{ needs.image-main.outputs.tags }}
@@ -638,6 +645,21 @@ reviewed `zizmor: ignore[secrets-inherit]`.
       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
     secrets: inherit # zizmor: ignore[secrets-inherit] environment secrets need it
 ```
+
+On adoption, update each caller's reviewed workflow SHA and add `contents: read` and
+`packages: write` to its calling job. The latter is granted only to the reusable deploy job;
+`plan` and `record` keep no token permissions. The package must allow the caller repository to
+write, as for the image workflow. No additional secret or separate automatic tag job is needed.
+The manual `deployed-tag.yml` boundary stays limited to dispatches on the default branch.
+
+A failed deploy or live verification leaves the previous tag untouched. Checkout, GHCR login,
+manifest retag and digest inspection run only after verification succeeds. The script is read from
+this reusable workflow's own reviewed commit (`job.workflow_sha`), never from the caller's code.
+The existing pinned actionlint needs the same narrow job-context exception as `status.yml`.
+If tagging fails after the app is live, the deploy job fails: restore package access or registry
+availability, then use the manual workflow with the verified running digest. Keep retention in
+dry-run until the first real caller confirms the tag digest matches. To roll back this workflow
+change, restore the caller's previous pin and permissions and resume manual tagging after deploys.
 
 The wiki reports the build in the page footer, so it passes `verify-url: https://wiki.verbanium.dev/`
 and no `verify-json-field`.

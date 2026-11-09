@@ -5,7 +5,7 @@
 #   record  creates the GitHub Deployment with the verbanium-ci App (Tower reads it later);
 #   deploy  joins the tailnet as an ephemeral tag:ci node (Tailscale workload identity, no stored
 #           key), sets the digest as the Coolify image tag, deploys, waits for Coolify, then waits
-#           until the live site reports this commit.
+#           until the live site reports this commit, then protects the digest with deployed-<env>.
 # The deploy secrets TS_OAUTH_CLIENT_ID, TS_AUDIENCE and COOLIFY_DEPLOY_TOKEN are secrets of the
 # caller's environment (default `production`, main-only branch policy); the record and deploy jobs
 # run in that environment. The calling job must use `secrets: inherit`: without it GitHub resolves
@@ -21,10 +21,13 @@
 #     needs: [checks, image-main]
 #     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 #     permissions:
+#       contents: read
 #       id-token: write
+#       packages: write
 #     uses: verbanium-lab/.github/.github/workflows/deploy-coolify.yml@REVIEWED_WORKFLOW_COMMIT
 #     with:
 #       app: studio
+#       env: prod # Default; use rc with release-candidate, dev with dev.
 #       image: ${{ needs.image-main.outputs.image }}
 #       digest: ${{ needs.image-main.outputs.digest }}
 #       image-tags: ${{ needs.image-main.outputs.tags }}
@@ -88,6 +91,11 @@ on:
         required: false
         type: string
         default: production
+      env:
+        description: Deployed protection tag environment; dev, rc or prod, matching environment
+        required: false
+        type: string
+        default: prod
       client-id:
         description: Client ID of the verbanium-ci GitHub App
         required: true
@@ -128,6 +136,7 @@ jobs:
       verify-url: ${{ steps.plan.outputs.verify-url }}
       verify-json-field: ${{ steps.plan.outputs.verify-json-field }}
       environment: ${{ steps.plan.outputs.environment }}
+      tag: ${{ steps.plan.outputs.tag }}
       client-id: ${{ steps.plan.outputs.client-id }}
     steps:
       - name: Validate inputs against this run
@@ -144,6 +153,7 @@ jobs:
           VERIFY_URL: ${{ inputs.verify-url }}
           VERIFY_FIELD: ${{ inputs.verify-json-field }}
           TARGET_ENV: ${{ inputs.environment }}
+          TAG_ENV: ${{ inputs.env }}
           CLIENT_ID: ${{ inputs.client-id }}
         run: |
           set -euo pipefail
@@ -162,6 +172,11 @@ jobs:
           [[ "$VERIFY_URL" =~ $url_re ]] || fail "verify-url must be an https verbanium.dev URL"
           [[ -z "$VERIFY_FIELD" || "$VERIFY_FIELD" =~ ^[a-z][a-zA-Z0-9_]{0,30}$ ]] || fail "invalid verify-json-field"
           [[ "$TARGET_ENV" =~ ^(production|release-candidate|dev)$ ]] || fail "unknown environment"
+          [[ "$TAG_ENV" =~ ^(dev|rc|prod)$ ]] || fail "env must be dev, rc or prod"
+          case "$TARGET_ENV:$TAG_ENV" in
+            production:prod|release-candidate:rc|dev:dev) ;;
+            *) fail "env must match environment (production/prod, release-candidate/rc, dev/dev)" ;;
+          esac
           [[ "$CLIENT_ID" =~ ^Iv[0-9A-Za-z.]{8,40}$ ]] || fail "invalid GitHub App client ID"
           {
             echo "app=$APP"
@@ -175,6 +190,7 @@ jobs:
             echo "verify-url=$VERIFY_URL"
             echo "verify-json-field=$VERIFY_FIELD"
             echo "environment=$TARGET_ENV"
+            echo "tag=deployed-$TAG_ENV"
             echo "client-id=$CLIENT_ID"
           } >> "$GITHUB_OUTPUT"
 
@@ -231,8 +247,10 @@ jobs:
     name: deploy
     needs: [plan, record]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     permissions:
+      contents: read # Read only this workflow's shared retag script.
+      packages: write # Protect the digest only after live verification.
       id-token: write # Tailscale workload identity (GitHub OIDC token)
     environment:
       name: ${{ needs.plan.outputs.environment }}
@@ -314,3 +332,27 @@ jobs:
             sleep 10
           done
           echo "::error::$VERIFY_URL does not report $SHA7 five minutes after the deploy finished"; exit 1
+      - name: Check out retag script
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: verbanium-lab/.github
+          ref: ${{ job.workflow_sha }} # This reusable workflow's reviewed commit, never caller code.
+          path: _github-defaults
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: .github/scripts/retag-deployed.sh
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Retag the deployed digest and verify
+        env:
+          IMAGE: ${{ needs.plan.outputs.image }}
+          DIGEST: ${{ needs.plan.outputs.digest }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: bash _github-defaults/.github/scripts/retag-deployed.sh
+      - name: Log out of GHCR
+        if: ${{ always() }}
+        run: docker logout ghcr.io
