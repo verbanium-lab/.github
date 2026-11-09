@@ -180,6 +180,68 @@ class DefaultsTests(unittest.TestCase):
             with self.assertRaisesRegex(validator.Invalid, 'through env'):
                 validator.validate_reusable(workflow, kind)
 
+    def test_reusable_runner_input_contract(self):
+        kinds = ('image', 'cleanup', 'deployed', 'release', 'notify', 'status', 'deploy', 'merge', 'automerge')
+        for kind in kinds:
+            workflow = self.reusable(kind)
+            runner = workflow[True]['workflow_call']['inputs']['runs-on']
+            self.assertEqual((runner['type'], runner['default']), ('string', 'ubuntu-24.04'))
+            job = next(iter(workflow['jobs']))
+
+            def drop(w):
+                del w[True]['workflow_call']['inputs']['runs-on']
+
+            for mutate in (
+                drop,
+                lambda w: w[True]['workflow_call']['inputs']['runs-on'].update(default='vl-light'),
+                lambda w: w[True]['workflow_call']['inputs']['runs-on'].update(required=True),
+                lambda w: w[True]['workflow_call']['inputs']['runs-on'].update(type='boolean'),
+                lambda w: w['jobs'][job].update({'runs-on': 'ubuntu-24.04'}),
+                lambda w: w['jobs'][job].update({'runs-on': 'self-hosted'}),
+                lambda w: w['jobs'][job].pop('runs-on'),
+                lambda w: w['jobs'][job]['steps'][-1].update(env={'LABEL': '${{ inputs.runs-on }}'}),
+            ):
+                bad = copy.deepcopy(workflow)
+                mutate(bad)
+                with self.subTest(kind=kind, workflow=bad), self.assertRaises(validator.Invalid):
+                    validator.validate_reusable(bad, kind)
+
+    def test_image_runner_cache_and_login_rejections(self):
+        def step(workflow, job, name):
+            return next(s for s in workflow['jobs'][job]['steps'] if s.get('name') == name)
+
+        def build_push(workflow, job):
+            return next(s for s in workflow['jobs'][job]['steps']
+                        if s.get('uses', '').startswith('docker/build-push-action@'))
+
+        emulation = 'Require aarch64 emulation on non-arm64 runners'
+        for mutate in (
+            lambda w: w[True]['workflow_call']['inputs']['runs-on-arm64'].update(default='ubuntu-24.04'),
+            lambda w: w[True]['workflow_call']['inputs'].pop('runs-on-arm64'),
+            lambda w: w['jobs']['push'].update({'runs-on': '${{ inputs.runs-on }}'}),
+            lambda w: w['jobs']['plan']['steps'][0]['env'].pop('RUNS_ON_ARM64'),
+            lambda w: w['jobs']['plan']['steps'][0].update(
+                run=w['jobs']['plan']['steps'][0]['run'].replace("'ubuntu-24.04' if fork else ", '')),
+            lambda w: w['jobs']['plan']['outputs'].pop('fork'),
+            lambda w: build_push(w, 'push')['with'].update({'cache-to': "${{ inputs.push-mode == 'main' && "
+                                                            "'type=registry,ref=ghcr.io/x:buildcache,mode=max' || '' }}"}),
+            lambda w: build_push(w, 'push')['with'].update({'cache-from': 'type=gha'}),
+            lambda w: build_push(w, 'build')['with'].update({'cache-from': 'type=registry,ref=ghcr.io/other:buildcache'}),
+            lambda w: step(w, 'build', 'Log in to GHCR to read the build cache').pop('if'),
+            lambda w: step(w, 'push', 'Log in to GHCR').update({'if': '${{ false }}'}),
+            lambda w: step(w, 'push', 'Log in to GHCR')['env'].update(GH_TOKEN='${{ secrets.GHCR_TOKEN }}'),
+            lambda w: w['jobs']['build']['steps'].pop(),
+            lambda w: w['jobs']['merge']['steps'][-1].pop('if'),
+            lambda w: step(w, 'push', emulation).update({'if': "${{ matrix.arch == 'arm64' }}"}),
+            lambda w: step(w, 'build', emulation).update(run='true'),
+            lambda w: w['jobs']['push']['steps'].remove(step(w, 'push', emulation)),
+            lambda w: build_push(w, 'push').update({'if': "${{ github.event_name == 'push' }}"}),
+        ):
+            workflow = self.reusable('image')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'image')
+
     def test_image_credential_and_event_rejections(self):
         for mutate in (
             lambda w: w.update(on={'pull_request_target': None}),

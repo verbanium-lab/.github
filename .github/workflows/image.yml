@@ -37,6 +37,18 @@ on:
           values match [A-Za-z0-9._:/+-]{0,128}. Public values derived only from the commit; never secrets
         default: ''
         type: string
+      runs-on:
+        description: >-
+          Runner label for the plan, merge and linux/amd64 jobs, e.g. vars.CI_RUNS_ON. Fork pull requests
+          always build on ubuntu-24.04
+        default: ubuntu-24.04
+        type: string
+      runs-on-arm64:
+        description: >-
+          Runner label for linux/arm64 jobs. A native arm64 runner builds natively; an x86_64 runner builds
+          through QEMU and needs aarch64 binfmt in its image. Fork pull requests always use ubuntu-24.04-arm
+        default: ubuntu-24.04-arm
+        type: string
     outputs:
       image:
         description: Image name without a tag or digest
@@ -61,13 +73,14 @@ concurrency:
 
 jobs:
   plan:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       image: ${{ steps.plan.outputs.image }}
       tag: ${{ steps.plan.outputs.tag }}
       publish: ${{ steps.plan.outputs.publish }}
+      fork: ${{ steps.plan.outputs.fork }}
       build-args: ${{ steps.plan.outputs.build-args }}
     steps:
       - name: Validate inputs and publication boundary
@@ -80,6 +93,8 @@ jobs:
           PLATFORMS: ${{ inputs.platforms }}
           MODE: ${{ inputs.push-mode }}
           BUILD_ARGS: ${{ inputs.build-args }}
+          RUNS_ON: ${{ inputs.runs-on }}
+          RUNS_ON_ARM64: ${{ inputs.runs-on-arm64 }}
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
           SHA: ${{ github.sha }}
@@ -110,18 +125,23 @@ jobs:
           for arg in build_args:
               require(re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}=[A-Za-z0-9._:/+-]{0,128}', arg), 'Invalid build argument')
           require(len({arg.split('=', 1)[0] for arg in build_args}) == len(build_args), 'Duplicate build argument')
-          runners = {'linux/amd64': 'ubuntu-24.04', 'linux/arm64': 'ubuntu-24.04-arm'}
+          # Fork pull request code never runs on self-hosted runners, whatever the caller passes.
+          fork = env['EVENT'] == 'pull_request' and env['HEAD_REPOSITORY'] != env['REPOSITORY']
+          runners = {'linux/amd64': 'ubuntu-24.04' if fork else env['RUNS_ON'],
+                     'linux/arm64': 'ubuntu-24.04-arm' if fork else env['RUNS_ON_ARM64']}
+          require(all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', r) for r in runners.values()),
+                  'Invalid runner label')
           platforms = [p.strip() for p in env['PLATFORMS'].split(',')]
           require(platforms and len(set(platforms)) == len(platforms)
                   and all(p in runners for p in platforms), 'Unsupported or duplicate platform')
           require(re.fullmatch(r'[0-9a-f]{40}', env['SHA']), 'Invalid source SHA')
           mode = env['MODE']
           require(mode in ('main', 'preview', 'none'), 'Invalid push mode')
-          require(env['EVENT'] == 'pull_request'
-                  or (env['EVENT'] == 'push' and env['REF'] == 'refs/heads/main'), 'Unsupported build event')
+          on_main = env['EVENT'] in ('push', 'workflow_dispatch') and env['REF'] == 'refs/heads/main'
+          require(env['EVENT'] == 'pull_request' or on_main, 'Unsupported build event')
           tag = ''
           if mode == 'main':
-              require(env['EVENT'] == 'push' and env['REF'] == 'refs/heads/main', 'Main push required')
+              require(on_main, 'Main push or dispatch required')
               tag = 'sha-' + env['SHA']
           elif mode == 'preview':
               require(env['EVENT'] == 'pull_request' and env['HEAD_REPOSITORY'] == env['REPOSITORY']
@@ -131,7 +151,8 @@ jobs:
           with open(env['GITHUB_OUTPUT'], 'a') as output:
               for key, value in {'matrix': json.dumps(matrix, separators=(',', ':')),
                                  'image': env['IMAGE'], 'tag': tag,
-                                 'publish': str(mode != 'none').lower()}.items():
+                                 'publish': str(mode != 'none').lower(),
+                                 'fork': str(fork).lower()}.items():
                   print(f'{key}={value}', file=output)
               # Validated lines cannot contain the delimiter (no '='), so the multiline value is injection-safe.
               if build_args:
@@ -157,6 +178,21 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Require aarch64 emulation on non-arm64 runners
+        if: ${{ matrix.arch == 'arm64' && runner.arch != 'ARM64' }}
+        # QEMU comes from the runner image (binfmt_misc); this job never installs it.
+        run: |
+          if [[ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
+            echo "::error::linux/arm64 on a $RUNNER_ARCH runner needs QEMU binfmt for aarch64; use a native arm64 runs-on-arm64 or register QEMU in the runner image"
+            exit 1
+          fi
+      - name: Log in to GHCR to read the build cache
+        # A fork pull request token cannot read private packages; it builds without the cache.
+        if: ${{ needs.plan.outputs.fork == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
       - name: Build without publishing
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
@@ -172,10 +208,14 @@ jobs:
             org.opencontainers.image.title=${{ inputs.app-name }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha,scope=${{ inputs.app-name }}-${{ matrix.arch }}-main
+          # Ephemeral runners start empty: read the main registry cache (a missing cache only warns).
+          cache-from: type=registry,ref=${{ needs.plan.outputs.image }}:buildcache-${{ matrix.arch }}
         env:
           DOCKER_BUILD_SUMMARY: 'false'
           DOCKER_BUILD_RECORD_UPLOAD: 'false'
+      - name: Log out of GHCR
+        if: ${{ always() }}
+        run: docker logout ghcr.io
 
   push:
     name: Publish platform (${{ matrix.platform }})
@@ -194,6 +234,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Require aarch64 emulation on non-arm64 runners
+        if: ${{ matrix.arch == 'arm64' && runner.arch != 'ARM64' }}
+        # QEMU comes from the runner image (binfmt_misc); this job never installs it.
+        run: |
+          if [[ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
+            echo "::error::linux/arm64 on a $RUNNER_ARCH runner needs QEMU binfmt for aarch64; use a native arm64 runs-on-arm64 or register QEMU in the runner image"
+            exit 1
+          fi
       - name: Log in to GHCR
         env:
           GH_TOKEN: ${{ github.token }}
@@ -215,9 +263,10 @@ jobs:
             org.opencontainers.image.title=${{ inputs.app-name }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha,scope=${{ inputs.app-name }}-${{ matrix.arch }}-main
-          # PRs never save caches; only main can populate a publishing cache.
-          cache-to: ${{ inputs.push-mode == 'main' && format('type=gha,scope={0}-{1}-main,mode=max', inputs.app-name, matrix.arch) || '' }}
+          cache-from: type=registry,ref=${{ needs.plan.outputs.image }}:buildcache-${{ matrix.arch }}
+          # PRs never save caches; only main can populate a publishing cache. A failed cache export
+          # never fails the publication.
+          cache-to: ${{ inputs.push-mode == 'main' && format('type=registry,ref={0}:buildcache-{1},mode=max,ignore-error=true', needs.plan.outputs.image, matrix.arch) || '' }}
         env:
           DOCKER_BUILD_SUMMARY: 'false'
           DOCKER_BUILD_RECORD_UPLOAD: 'false'
@@ -241,7 +290,7 @@ jobs:
 
   merge:
     needs: [plan, push]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
     permissions:
       packages: write

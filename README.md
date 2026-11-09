@@ -29,7 +29,7 @@ local check and the owner-controlled activation steps.
 
 | Workflow | Purpose |
 | --- | --- |
-| [image.yml](.github/workflows/image.yml) | Native amd64/arm64 builds, main and same-repository preview publication, provenance and SBOM |
+| [image.yml](.github/workflows/image.yml) | amd64/arm64 builds (native, or arm64 through QEMU on x86_64 runners), registry build cache, main and same-repository preview publication, provenance and SBOM |
 | [ghcr-cleanup.yml](.github/workflows/ghcr-cleanup.yml) | Per-package retention with protected release/deployed tags; dry-run by default |
 | [deployed-tag.yml](.github/workflows/deployed-tag.yml) | Moves `deployed-<env>` to the digest that runs in an environment, without pulling layers |
 | [status.yml](.github/workflows/status.yml) | Refreshes the README status table from releases, GHCR deployed tags and optional coverage |
@@ -41,6 +41,28 @@ local check and the owner-controlled activation steps.
 See [caller recipes and adoption requirements](docs/reusable-workflows.md) for fixed-app wiki and
 affected-matrix Tower examples, release-commit filters and token boundaries. Unresolved action pins
 must be completed before adoption. This change does not migrate any app caller.
+
+## Runners (self-hosted bench-01)
+
+Every reusable workflow takes an optional `runs-on` input (default `ubuntu-24.04`) for all of its
+jobs; `image.yml` also takes `runs-on-arm64` (default `ubuntu-24.04-arm`). Without them nothing
+changes. Owner decision 2026-11-09: image builds, release notices and the small service jobs may
+run on the self-hosted bench-01 runners. This replaces "jobs with write tokens stay GitHub-hosted".
+Conditions: one ephemeral VM per job, only the job-scoped `GITHUB_TOKEN` (no other secrets in image
+jobs, `docker logout` always), no fork pull request code on self-hosted runners (`image.yml`
+sends fork builds to GitHub-hosted runners), publication only from main pushes or dispatches from
+main (previews only from same-repository pull requests), and per-package "Manage Actions access"
+limited to the owning repository. Deploys (`deploy-coolify.yml`) stay GitHub-hosted: they need the
+tailnet. Callers decode the JSON organization variable:
+
+```yaml
+    with:
+      runs-on: ${{ vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-24.04' }}
+```
+
+Fallback: delete `CI_RUNS_ON` and `CI_RUNS_ON_HEAVY` (or set them to `"ubuntu-24.04"`) and the
+next runs are GitHub-hosted again. Details, the image caller and arm64 notes:
+[Runners](docs/reusable-workflows.md#runners).
 
 ## Risk low auto-merge
 

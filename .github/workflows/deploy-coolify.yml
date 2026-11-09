@@ -100,6 +100,10 @@ on:
         description: Client ID of the verbanium-ci GitHub App
         required: true
         type: string
+      runs-on:
+        description: Runner label for every job, e.g. vars.CI_RUNS_ON
+        default: ubuntu-24.04
+        type: string
     # All optional; the caller passes them with `secrets: inherit` (environment and organization
     # secrets). Declared so that the names are reviewed (actionlint).
     secrets:
@@ -121,7 +125,7 @@ permissions: {}
 jobs:
   plan:
     name: plan
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 2
     permissions: {}
     outputs:
@@ -199,7 +203,7 @@ jobs:
   record:
     name: deployment record
     needs: plan
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
     permissions: {}
     environment:
@@ -246,7 +250,7 @@ jobs:
   deploy:
     name: deploy
     needs: [plan, record]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 20
     permissions:
       contents: read # Read only this workflow's shared retag script.

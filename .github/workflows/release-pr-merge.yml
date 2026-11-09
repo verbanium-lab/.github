@@ -41,6 +41,10 @@ on:
         description: verbanium-ci App client ID (vars.VERBANIUM_CI_CLIENT_ID of the caller)
         required: true
         type: string
+      runs-on:
+        description: Runner label for every job, e.g. vars.CI_RUNS_ON
+        default: ubuntu-24.04
+        type: string
     secrets:
       VERBANIUM_CI_PRIVATE_KEY:
         description: verbanium-ci App private key (organization secret)
@@ -54,7 +58,7 @@ defaults:
 
 jobs:
   merge:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 5
     # Only to read the `ci` check runs of the Release PR head; the merge uses the App token.
     permissions:

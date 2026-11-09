@@ -107,7 +107,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
             output = Path(directory) / 'output'
             env = dict(APP='wiki', IMAGE='ghcr.io/verbanium-lab/wiki', DOCKERFILE='portal/Dockerfile',
                        CONTEXT='.', PLATFORMS='linux/amd64,linux/arm64', MODE='main', BUILD_ARGS='',
-                       EVENT='push', REF='refs/heads/main', SHA='a' * 40,
+                       RUNS_ON='ubuntu-24.04', RUNS_ON_ARM64='ubuntu-24.04-arm', EVENT='push', REF='refs/heads/main', SHA='a' * 40,
                        REPOSITORY='verbanium-lab/wiki', HEAD_REPOSITORY='', PR_NUMBER='',
                        GITHUB_OUTPUT=str(output))
             env.update(changes)
@@ -127,6 +127,45 @@ class WorkflowBehaviorTests(unittest.TestCase):
         result, values = self.plan(PLATFORMS='linux/arm64')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(json.loads(values['matrix'])['include']), 1)
+
+    def test_runner_inputs_choose_the_matrix_runners(self):
+        result, values = self.plan(RUNS_ON='vl-heavy', RUNS_ON_ARM64='vl-heavy')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([p['runner'] for p in json.loads(values['matrix'])['include']], ['vl-heavy', 'vl-heavy'])
+        self.assertEqual(values['fork'], 'false')
+        result, values = self.plan(MODE='preview', EVENT='pull_request', REF='refs/pull/8/merge',
+                                   HEAD_REPOSITORY='verbanium-lab/wiki', PR_NUMBER='8', RUNS_ON='vl-light')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(values['matrix'])['include'][0]['runner'], 'vl-light')
+
+    def test_fork_pull_requests_never_use_self_hosted_runners(self):
+        result, values = self.plan(MODE='none', EVENT='pull_request', HEAD_REPOSITORY='outside/wiki', PR_NUMBER='8',
+                                   RUNS_ON='vl-heavy', RUNS_ON_ARM64='vl-heavy')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(values['fork'], 'true')
+        self.assertEqual([p['runner'] for p in json.loads(values['matrix'])['include']],
+                         ['ubuntu-24.04', 'ubuntu-24.04-arm'])
+
+    def test_reject_malformed_runner_labels(self):
+        for changes in (dict(RUNS_ON=''), dict(RUNS_ON_ARM64=''), dict(RUNS_ON='["self-hosted"]'),
+                        dict(RUNS_ON='"vl-light"'), dict(RUNS_ON='vl light'), dict(RUNS_ON='vl\ninjected=value'),
+                        dict(RUNS_ON='x' * 65)):
+            with self.subTest(changes=changes):
+                result, output = self.plan(**changes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(output, {})
+
+    def test_dispatch_from_main_publishes_the_main_tag(self):
+        result, values = self.plan(EVENT='workflow_dispatch')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((values['tag'], values['publish']), ('sha-' + 'a' * 40, 'true'))
+        for changes in (dict(EVENT='workflow_dispatch', REF='refs/heads/feature'),
+                        dict(EVENT='workflow_dispatch', MODE='preview'),
+                        dict(EVENT='workflow_dispatch', REF='refs/tags/v1.0.0')):
+            with self.subTest(changes=changes):
+                result, output = self.plan(**changes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(output, {})
 
     def test_same_repository_preview_uses_tested_sha(self):
         result, values = self.plan(MODE='preview', EVENT='pull_request', REF='refs/pull/8/merge',
@@ -199,7 +238,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
     def test_build_args_cannot_forge_other_outputs(self):
         result, values = self.plan(BUILD_ARGS='KEY=value')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(set(values), {'matrix', 'image', 'tag', 'publish', 'build-args'})
+        self.assertEqual(set(values), {'matrix', 'image', 'tag', 'publish', 'build-args', 'fork'})
 
     def test_merge_rejects_missing_extra_or_invalid_artifacts(self):
         for files, success in (

@@ -34,12 +34,15 @@ Call `.github/workflows/image.yml` by a reviewed commit SHA. Inputs are `app-nam
 (default `linux/amd64,linux/arm64`), `push-mode` (`main`, `preview`, `none`; default `none`),
 optional `npm-registry-auth` (boolean, default `false`; see [Private npm packages](#private-npm-packages)),
 and optional newline-separated `build-args` (default empty; see [Build arguments](#build-arguments)).
+Optional `runs-on` (default `ubuntu-24.04`) and `runs-on-arm64` (default `ubuntu-24.04-arm`) choose
+the runners; see [Runners](#runners).
 
-Native `ubuntu-24.04` and `ubuntu-24.04-arm` jobs build one platform each. Publishing jobs push
-by digest and upload only digest files, retained for one day. A separate job downloads this run's
-artifacts, checks the expected architectures and digest syntax, then creates one OCI index. Even
-a single-platform publication gets an index because BuildKit attaches provenance and an SBOM.
-The merge preserves these attachments. No QEMU or cross-architecture runtime emulation is used.
+One job per platform builds that platform: `linux/amd64` on `runs-on`, `linux/arm64` on
+`runs-on-arm64`. Publishing jobs push by digest and upload only digest files, retained for one day.
+A separate job downloads this run's artifacts, checks the expected architectures and digest syntax,
+then creates one OCI index. Even a single-platform publication gets an index because BuildKit
+attaches provenance and an SBOM. The merge preserves these attachments. With the defaults both
+platforms build natively; arm64 on an x86_64 runner uses QEMU (see [Runners](#runners)).
 
 Outputs are `image` (untagged name), `digest` (published index `sha256:...`) and `tags` (the fully
 qualified published tag). `digest` and `tags` are empty in `none` mode. Deploy using
@@ -50,9 +53,13 @@ work must collect each app's result explicitly.
 Main tags use `sha-<full 40-character github.sha>`. Preview tags use
 `pr-<number>-<first 12 characters of github.sha>`. For `pull_request`, this is the tested merge
 commit, also used by checkout and the revision label, rather than the PR head commit. The OCI
-title, source URL and full revision are included for every platform. GHA cache scopes are
-`<app>-<arch>-main`; builds can read them, but only main publications export caches. Preview and
-fork code cannot populate publishing caches. Call each app at most once per caller run, and
+title, source URL and full revision are included for every platform. The BuildKit cache lives in
+the registry as `<image>:buildcache-<arch>` (`mode=max`), so ephemeral runners do not rebuild from
+scratch. Every build reads it; only main publications write it, with `ignore-error=true` so a cache
+failure never fails a publication. Preview and fork code cannot populate the cache, and fork pull
+requests do not log in, so they build without it. Retention never deletes `buildcache-*` tags;
+superseded cache manifests become untagged and are removed by the cleanup's untagged pass.
+Call each app at most once per caller run, and
 keep app names unique, to avoid digest-artifact collisions.
 Each image must have one owning caller repository. The reusable workflow serializes calls for
 the same image, source SHA and mode so a rerun cannot replace the tag between index creation and
@@ -65,13 +72,78 @@ is rejected even when the job is skipped or calls `none` mode. Inside the reusab
 platform publication and index merge jobs get `packages: write`; `none` jobs get `contents: read`
 and `packages: read`. Job permissions are static, so the read grant is present even when npm auth
 is off; the token is passed to BuildKit only when `npm-registry-auth: true`.
-The workflow rejects main publication outside a main push and preview publication outside a
-same-repository `pull_request`. It rejects privileged PR events, including `pull_request_target`.
+The workflow rejects main publication outside a main push or a `workflow_dispatch` from main, and
+preview publication outside a same-repository `pull_request`. It rejects privileged PR events, including `pull_request_target`.
 `none` mode builds without publishing and runs with read-only permissions, but see
 [Why callers have no fork job](#why-callers-have-no-fork-job): a caller job that calls this
 workflow must still be granted `packages: write`. Same-repository previews use only
 `GITHUB_TOKEN`; no App token or environment secret is available. Existing image packages
 must grant the caller repository the required GHCR access.
+
+## Runners
+
+Every reusable workflow has an optional string input `runs-on`, the runner label for all of its
+jobs. It defaults to `ubuntu-24.04`, so a caller that does not set it behaves as before.
+`image.yml` also has `runs-on-arm64` (default `ubuntu-24.04-arm`) for its `linux/arm64` jobs.
+
+Owner decision 2026-11-09: publishing, release and small service jobs (image builds, release
+notices, the Release PR merge, risk-low merge, registry cleanup, the status table and tag moves)
+may run on the self-hosted bench-01 runners, to stop paying for Actions minutes. This replaces the
+rule "jobs with write tokens stay GitHub-hosted". It holds only under all of these conditions:
+
+- Every job gets its own ephemeral VM (GARM with Incus on bench-01), deleted after the job.
+- Jobs use only their job-scoped `GITHUB_TOKEN` (and, where a workflow already uses it, the
+  verbanium-ci App token behind the `production` environment). Image jobs take no secret;
+  `docker login` uses the job token, and `docker logout` runs in `always()`.
+- No fork pull request code runs on self-hosted runners. `image.yml` ignores `runs-on` and
+  `runs-on-arm64` for fork pull requests and builds them on `ubuntu-24.04` and `ubuntu-24.04-arm`.
+  The bench runner group admits only selected private repositories.
+- Main images publish only from a main push or a `workflow_dispatch` from main; previews only from
+  same-repository pull requests. Only the publishing jobs get `packages: write`.
+- Each GHCR package limits "Manage Actions access" to its owning repository.
+
+Deploys stay GitHub-hosted: `deploy-coolify.yml` joins the tailnet, and the bench VMs have no
+tailnet access and must not hold deploy secrets. It has the `runs-on` input for consistency only;
+its callers do not set it.
+
+The organization variable `CI_RUNS_ON` holds a JSON string such as `"vl-light"` (and
+`CI_RUNS_ON_HEAVY` holds `"vl-heavy"`). Inputs take a plain label, so callers decode it. Use the
+heavy pool for image builds:
+
+```yaml
+  image-main:
+    uses: verbanium-lab/.github/.github/workflows/image.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      runs-on: ${{ vars.CI_RUNS_ON_HEAVY && fromJSON(vars.CI_RUNS_ON_HEAVY) || 'ubuntu-24.04' }}
+      runs-on-arm64: ${{ vars.CI_RUNS_ON_HEAVY && fromJSON(vars.CI_RUNS_ON_HEAVY) || 'ubuntu-24.04-arm' }}
+      # other inputs unchanged
+
+  notify:
+    uses: verbanium-lab/.github/.github/workflows/release-notify.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      runs-on: ${{ vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-24.04' }}
+      tags: ${{ needs.release-please.outputs.tags }}
+```
+
+The variable must hold a single JSON string, not an array: a string input cannot take a label
+list. `image.yml` rejects any label outside `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
+
+Fallback: delete the organization (or repository) variables `CI_RUNS_ON` and `CI_RUNS_ON_HEAVY`,
+or set them to `"ubuntu-24.04"`. Every caller returns to GitHub-hosted runners on its next run
+without a code change. Prefer deleting `CI_RUNS_ON_HEAVY`: only then do arm64 jobs return to
+`ubuntu-24.04-arm`. With `"ubuntu-24.04"`, arm64 jobs land on an x86_64 hosted runner without QEMU
+and fail the emulation check below.
+
+### arm64 on x86_64 runners
+
+bench-01 is x86_64. On an x86_64 runner, `linux/arm64` builds run under QEMU user emulation, which
+is several times slower than native for compile-heavy stages; watch the 30-minute job timeout. The
+runner image registers QEMU for aarch64 through `binfmt_misc` (infra role `ci_runners`). The image
+jobs never install it: on a non-arm64 runner an arm64 job first checks
+`/proc/sys/fs/binfmt_misc/qemu-aarch64` and fails with an error when it is missing. A native arm64
+runner (`ubuntu-24.04-arm` or a self-hosted arm64 label in `runs-on-arm64`) skips that check and
+builds natively, as before. `docker/setup-qemu-action` is not used yet: its pin was not verified
+offline (needs verification), and the runner image already provides QEMU.
 
 ## Build arguments
 
@@ -667,8 +739,8 @@ and no `verify-json-field`.
 ## Verification and recovery
 
 Run the repository check from [CONTRIBUTING.md](../CONTRIBUTING.md). Rejection tests cover action
-pinning, build-argument validation and its raw-input boundary, token permissions, PR publication boundaries, malformed digest artifacts, cache writes
-and cleanup retention. Offline tests cannot prove action input compatibility or registry effects.
+pinning, build-argument validation and its raw-input boundary, token permissions, PR publication boundaries, malformed digest artifacts, cache writes,
+runner inputs, the fork runner fallback, registry login and logout, and cleanup retention. Offline tests cannot prove action input compatibility or registry effects.
 In a disposable caller/package, first build `none`, publish both native platforms, inspect the
 index's platform descriptors and attestation manifests, and exercise cleanup with protected,
 expired and multi-tagged versions in dry-run. Compare candidates with the policy before enabling
