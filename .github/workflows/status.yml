@@ -74,9 +74,9 @@ jobs:
       - name: Check out status scripts
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          repository: verbanium-lab/.github
           # This reusable workflow's own commit (job context): github.action_ref here would be the
           # ref of actions/checkout itself, which does not exist in this repository.
-          repository: ${{ job.workflow_repository }}
           ref: ${{ job.workflow_sha }}
           path: _github-defaults
           persist-credentials: false

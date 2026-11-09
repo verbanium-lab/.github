@@ -493,6 +493,13 @@ class StatusWorkflowTests(unittest.TestCase):
         step = text.split('- name: Commit status update', 1)[1].split('run:', 1)[0]
         self.assertIn('inputs.commit-readme &&', step)
 
+    def test_status_scripts_come_from_this_workflow_commit(self):
+        # github.action_ref inside the checkout step is the ref of actions/checkout itself.
+        text = (ROOT / '.github/workflows/status.yml').read_text()
+        step = text.split('- name: Check out status scripts', 1)[1].split('- name:', 1)[0]
+        self.assertIn('ref: ${{ job.workflow_sha }}', step)
+        self.assertNotIn('${{ github.action_ref }}', step)
+
 
 if __name__ == '__main__':
     unittest.main()
