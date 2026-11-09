@@ -45,6 +45,10 @@ on:
           option A with a dedicated App and ruleset bypass.
         default: false
         type: boolean
+      runs-on:
+        description: Runner label for every job, e.g. vars.CI_RUNS_ON
+        default: ubuntu-24.04
+        type: string
 
 permissions: {}
 
@@ -58,7 +62,7 @@ concurrency:
 
 jobs:
   status:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
     permissions:
       contents: write

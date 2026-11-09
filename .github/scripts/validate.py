@@ -246,6 +246,30 @@ def validate_retag_steps(steps, source):
             and steps.index(login) < steps.index(retag), "job token login required before retag")
 
 
+def validate_runners(call, jobs, kind):
+    """Every job runs on the caller's runner input, which defaults to the GitHub-hosted label.
+
+    Returns the call schema without the runner inputs, so the per-workflow input contracts stay exact.
+    """
+    defaults = {"runs-on": "ubuntu-24.04"}
+    if kind == "image":
+        defaults["runs-on-arm64"] = "ubuntu-24.04-arm"
+    declared = call.get("inputs") or {}
+    require(isinstance(declared, dict), "reusable inputs must be a mapping")
+    for name, default in defaults.items():
+        field = declared.get(name)
+        require(isinstance(field, dict) and field.get("type") == "string" and not field.get("required")
+                and field.get("default") == default, "optional runner input with the GitHub-hosted default: " + name)
+    for name, job in jobs.items():
+        matrix = kind == "image" and name in ("build", "push")
+        expected = "${{ matrix.runner }}" if matrix else "${{ inputs.runs-on }}"
+        require(job.get("runs-on") == expected, "jobs must run on the runner input")
+        # Runner inputs choose a machine only; they never reach a step.
+        require("inputs.runs-on" not in repr(job.get("steps", [])) or (kind == "image" and name == "plan"),
+                "runner inputs must not enter steps")
+    return {**call, "inputs": {k: v for k, v in declared.items() if k not in defaults}}
+
+
 def validate_reusable(workflow, kind):
     """Keep the reusable workflows inside their reviewed credential boundaries."""
     require(isinstance(workflow, dict), "workflow must be a mapping")
@@ -283,6 +307,7 @@ def validate_reusable(workflow, kind):
                             "checkout credentials must not persist")
     call = events["workflow_call"]
     require(isinstance(call, dict), "reusable call schema required")
+    call = validate_runners(call, jobs, kind)
     if kind == "image":
         require(set(jobs) == {"plan", "build", "push", "merge"}, "image job boundary required")
         require(not call.get("secrets"), "image workflow must not accept secrets")
@@ -333,8 +358,50 @@ def validate_reusable(workflow, kind):
                                 and "cache-to" not in options, "build-only must not publish or save caches")
                     else:
                         require("push-by-digest=true" in options.get("outputs", ""), "digest publication required")
-                        require(options.get("cache-to", "").startswith("${{ inputs.push-mode == 'main' &&"),
-                                "only main may save publishing caches")
+                        require(options.get("cache-to") == "${{ inputs.push-mode == 'main' && format("
+                                "'type=registry,ref={0}:buildcache-{1},mode=max,ignore-error=true', "
+                                "needs.plan.outputs.image, matrix.arch) || '' }}",
+                                "only main may save the registry cache, and a cache failure must not fail publication")
+                    require(options.get("cache-from")
+                            == "type=registry,ref=${{ needs.plan.outputs.image }}:buildcache-${{ matrix.arch }}",
+                            "registry cache of the validated image required")
+        # Self-hosted runners: the plan picks runners from validated labels, fork PRs stay GitHub-hosted,
+        # publication needs a main push or a dispatch from main.
+        plan_step = jobs["plan"]["steps"][0]
+        require(plan_step.get("env", {}).get("RUNS_ON") == "${{ inputs.runs-on }}"
+                and plan_step["env"].get("RUNS_ON_ARM64") == "${{ inputs.runs-on-arm64 }}",
+                "plan must read runner inputs through env")
+        plan_run = plan_step.get("run", "")
+        for needle in ("fork = env['EVENT'] == 'pull_request' and env['HEAD_REPOSITORY'] != env['REPOSITORY']",
+                       "'ubuntu-24.04' if fork else env['RUNS_ON']",
+                       "'ubuntu-24.04-arm' if fork else env['RUNS_ON_ARM64']",
+                       "'Invalid runner label'",
+                       "on_main = env['EVENT'] in ('push', 'workflow_dispatch') and env['REF'] == 'refs/heads/main'",
+                       "require(on_main, 'Main push or dispatch required')",
+                       "env['HEAD_REPOSITORY'] == env['REPOSITORY']"):
+            require(needle in plan_run, "image plan runner and event guard required: " + needle)
+        require(jobs["plan"].get("outputs", {}).get("fork") == "${{ steps.plan.outputs.fork }}", "fork plan output required")
+        for name in ("build", "push", "merge"):
+            steps = jobs[name]["steps"]
+            logins = [s for s in steps if "docker login" in s.get("run", "")]
+            require(len(logins) == 1 and logins[0].get("env") == {"GH_TOKEN": "${{ github.token }}", "ACTOR": "${{ github.actor }}"},
+                    "one docker login with the job token only")
+            require(logins[0].get("if") == ("${{ needs.plan.outputs.fork == 'false' }}" if name == "build" else None),
+                    "fork pull requests never log in; publication always does")
+            logout = steps[-1]
+            require(logout.get("run") == "docker logout ghcr.io" and logout.get("if") == "${{ always() }}",
+                    "docker logout must run last, always")
+            require(not re.findall(r"secrets\.", repr(steps)), "no secrets in image jobs")
+            if name != "merge":
+                emulation = [s for s in steps if s.get("name") == "Require aarch64 emulation on non-arm64 runners"]
+                require(len(emulation) == 1
+                        and emulation[0].get("if") == "${{ matrix.arch == 'arm64' && runner.arch != 'ARM64' }}"
+                        and "/proc/sys/fs/binfmt_misc/qemu-aarch64" in emulation[0].get("run", "")
+                        and "exit 1" in emulation[0].get("run", ""),
+                        "arm64 on a non-arm64 runner must fail closed without QEMU binfmt")
+            for step in steps:
+                require("if" not in step or step in logins + [steps[-1]] or step.get("name", "").startswith("Require aarch64"),
+                        "image steps must not be skipped")
     elif kind == "deployed":
         require(set(jobs) == {"tag"}, "one tag job required")
         require(not call.get("secrets"), "deployed-tag workflow must not accept secrets")
@@ -480,7 +547,7 @@ def validate_reusable(workflow, kind):
                 "the plan must bind the protection tag to the target environment")
         allowed_secrets = {"record": {"VERBANIUM_CI_PRIVATE_KEY"}, "deploy": {"TS_OAUTH_CLIENT_ID", "TS_AUDIENCE", "COOLIFY_DEPLOY_TOKEN"}}
         for name, job in jobs.items():
-            text = repr(job)
+            text = repr({k: v for k, v in job.items() if k != "runs-on"})
             if name != "plan":
                 require("inputs." not in text, "raw inputs may only enter the plan step through env")
             used = set(re.findall(r"secrets\.([A-Z0-9_]+)", text))

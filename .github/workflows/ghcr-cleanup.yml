@@ -11,6 +11,10 @@ on:
         description: Report candidates without deleting versions; disable only after review
         default: true
         type: boolean
+      runs-on:
+        description: Runner label for every job, e.g. vars.CI_RUNS_ON
+        default: ubuntu-24.04
+        type: string
     secrets:
       app-token:
         description: Optional verbanium-ci App installation token with package administration access
@@ -28,7 +32,7 @@ jobs:
     if: >-
       ${{ github.repository_owner == 'verbanium-lab' && github.ref == 'refs/heads/main' &&
           (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 15
     concurrency:
       group: ghcr-cleanup-${{ inputs.package-name }}

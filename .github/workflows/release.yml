@@ -36,6 +36,10 @@ on:
         description: Optional extra markdown appended after the generated release body
         default: ''
         type: string
+      runs-on:
+        description: Runner label for every job, e.g. vars.CI_RUNS_ON
+        default: ubuntu-24.04
+        type: string
     secrets:
       TELEGRAM_RELEASES_BOT_TOKEN:
         description: Telegram bot token for the Deployment and releases topic; omit to skip notify
@@ -69,7 +73,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
     permissions:
       contents: write
