@@ -29,6 +29,7 @@ OWNED_FILES = {
     ".github/tests/test_workflows.py", ".github/tests/test_risk_low_automerge.py",
     "docs/reusable-workflows.md",
     "lefthook.yml", ".github/scripts/hooks/pre-push.sh", ".github/scripts/hooks/staged.sh",
+    ".github/actionlint.yaml",
 }
 FIELDS = {
     "goal": ("textarea", "Goal", None),
@@ -612,6 +613,8 @@ def validate_reusable(workflow, kind):
         script_checkout = next((s for s in steps if s.get("name") == "Check out status scripts"), None)
         require(script_checkout is not None and script_checkout.get("with", {}).get("repository") == "verbanium-lab/.github",
                 "status scripts checkout required")
+        require(script_checkout.get("with", {}).get("ref") == "${{ job.workflow_sha }}",
+                "status scripts must be checked out at this workflow's own commit (job.workflow_sha)")
         require("collect_status.py" in repr(steps) and "render_status.py" in repr(steps),
                 "status data and render scripts required")
         commit = next((s for s in steps if s.get("name") == "Commit status update"), None)

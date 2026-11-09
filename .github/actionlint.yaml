@@ -1,0 +1,8 @@
+# actionlint configuration (https://github.com/rhysd/actionlint/blob/main/docs/config.md).
+paths:
+  .github/workflows/status.yml:
+    ignore:
+      # GitHub documents job.workflow_sha (changelog 2026-09-03) for a reusable workflow's own
+      # commit; actionlint 1.7.12 does not know it yet
+      # (rhysd/actionlint#707). Remove this entry once the pinned actionlint supports them.
+      - 'property "workflow_sha" is not defined in object type'
