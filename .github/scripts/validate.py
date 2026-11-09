@@ -24,6 +24,7 @@ OWNED_FILES = {
     ".github/workflows/status.yml", ".github/workflows/release-pr-merge.yml",
     ".github/workflows/risk-low-automerge.yml",
     ".github/scripts/risk_low_automerge.py",
+    ".github/scripts/retag-deployed.sh", ".github/tests/test_deploy_tag.py",
     ".github/scripts/collect_status.py", ".github/scripts/render_status.py",
     ".github/tests/test_status.py",
     ".github/tests/test_workflows.py", ".github/tests/test_risk_low_automerge.py",
@@ -218,6 +219,33 @@ def validate_workflow(workflow):
     require(any(step.get("run") == "bash .github/scripts/check.sh" for step in steps), "real repository check required")
 
 
+def validate_retag_steps(steps, source):
+    """Both callers execute the shared script from their reviewed workflow commit."""
+    retags = [s for s in steps if s.get("name") == "Retag the deployed digest and verify"]
+    require(len(retags) == 1, "one shared retag step required")
+    retag = retags[0]
+    require(retag.get("run", "").strip() == "bash _github-defaults/.github/scripts/retag-deployed.sh"
+            and retag.get("env") == {k: "${{ " + source + "." + k.lower() + " }}" for k in ("IMAGE", "DIGEST", "TAG")},
+            "retag must use the shared script and validated outputs")
+    checkouts = [s for s in steps if s.get("uses", "").startswith("actions/checkout@")]
+    require(len(checkouts) == 1, "one trusted retag script checkout required")
+    checkout = checkouts[0]
+    require(checkout.get("with") == {
+        "repository": "verbanium-lab/.github", "ref": "${{ job.workflow_sha }}", "path": "_github-defaults",
+        "persist-credentials": False, "sparse-checkout-cone-mode": False,
+        "sparse-checkout": ".github/scripts/retag-deployed.sh",
+    }, "retag script must come from this workflow's own commit")
+    require(steps.index(checkout) < steps.index(retag), "checkout must precede retag")
+    require(all("if" not in s for s in steps if s.get("name") != "Log out of GHCR"),
+            "deployment and retag steps must use the default success condition")
+    require(any(s.get("uses", "").startswith("docker/setup-buildx-action@") for s in steps[:steps.index(retag)]),
+            "Buildx setup required before retag")
+    login = next((s for s in steps if s.get("name") == "Log in to GHCR"), {})
+    require(login.get("env") == {"GH_TOKEN": "${{ github.token }}", "ACTOR": "${{ github.actor }}"}
+            and login.get("run") == 'printf \'%s\' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin'
+            and steps.index(login) < steps.index(retag), "job token login required before retag")
+
+
 def validate_reusable(workflow, kind):
     """Keep the reusable workflows inside their reviewed credential boundaries."""
     require(isinstance(workflow, dict), "workflow must be a mapping")
@@ -230,10 +258,10 @@ def validate_reusable(workflow, kind):
         "image": {"actions/checkout", "docker/setup-buildx-action", "docker/build-push-action",
                   "actions/upload-artifact", "actions/download-artifact"},
         "cleanup": {"dataaxiom/ghcr-cleanup-action"},
-        "deployed": {"docker/setup-buildx-action"},
+        "deployed": {"actions/checkout", "docker/setup-buildx-action"},
         "release": {"actions/checkout"},
         "notify": set(),
-        "deploy": {"actions/create-github-app-token", "tailscale/github-action"},
+        "deploy": {"actions/create-github-app-token", "tailscale/github-action", "actions/checkout", "docker/setup-buildx-action"},
         "status": {"actions/checkout", "actions/download-artifact"},
         "merge": {"actions/create-github-app-token"},
         "automerge": {"actions/checkout", "actions/create-github-app-token"},
@@ -334,9 +362,7 @@ def validate_reusable(workflow, kind):
         require({plan["env"].get(k) for k in ("IMAGE", "DIGEST", "TARGET_ENV", "RELEASE")}
                 == {"${{ inputs.image }}", "${{ inputs.digest }}", "${{ inputs.env }}", "${{ inputs.release }}"},
                 "validation must read inputs through env")
-        retag = " ".join(s.get("run", "") for s in steps)
-        require("docker buildx imagetools create --tag" in retag and "imagetools inspect" in retag
-                and "docker pull" not in retag, "manifest retag and verification required")
+        validate_retag_steps(steps, "steps.plan.outputs")
         require(any(s.get("name") == "Record GitHub Deployment" for s in steps), "deployment record step required")
         deployment = next(s for s in steps if s.get("name") == "Record GitHub Deployment")
         require("gh" in deployment.get("run", "") and "deployments" in deployment.get("run", ""),
@@ -410,7 +436,7 @@ def validate_reusable(workflow, kind):
                 "reviewed optional secrets only; deploy secrets come from the caller's environment")
         declared = call.get("inputs", {})
         required = {"app", "image", "digest", "image-tags", "sha7", "coolify-app-uuid", "site-url", "verify-url", "client-id"}
-        optional = {"build-number": "", "verify-json-field": "", "environment": "production"}
+        optional = {"build-number": "", "verify-json-field": "", "environment": "production", "env": "prod"}
         require(set(declared) == required | set(optional), "reviewed deploy inputs only")
         for name in required:
             field = declared[name]
@@ -426,23 +452,32 @@ def validate_reusable(workflow, kind):
                 "record uses only the App token")
         require(jobs["record"].get("environment") == {"name": "${{ needs.plan.outputs.environment }}", "deployment": False},
                 "record runs in the caller environment without an Actions deployment")
-        require(jobs["deploy"].get("permissions") == {"id-token": "write"} and jobs["deploy"].get("needs") == ["plan", "record"],
+        require(jobs["deploy"].get("permissions") == {"contents": "read", "id-token": "write", "packages": "write"}
+                and jobs["deploy"].get("needs") == ["plan", "record"] and "if" not in jobs["deploy"],
                 "deploy permission boundary required")
         require(jobs["deploy"].get("environment", {}).get("name") == "${{ needs.plan.outputs.environment }}",
                 "deploy runs in the caller environment")
         require(jobs["deploy"].get("concurrency", {}).get("cancel-in-progress") is False, "deploys must queue, never cancel")
+        require(jobs["deploy"].get("concurrency", {}).get("group")
+                == "deploy-${{ needs.plan.outputs.app }}-${{ needs.plan.outputs.environment }}",
+                "deploy and retag must share the app/environment lock")
         steps = jobs["plan"].get("steps", [])
         require(len(steps) == 1 and steps[0].get("id") == "plan", "one validation step required")
         expected = {"APP": "app", "IMAGE": "image", "DIGEST": "digest", "TAGS": "image-tags", "SHA7": "sha7",
                     "BUILD_NUMBER": "build-number", "APP_UUID": "coolify-app-uuid", "SITE_URL": "site-url",
                     "VERIFY_URL": "verify-url", "VERIFY_FIELD": "verify-json-field", "TARGET_ENV": "environment",
-                    "CLIENT_ID": "client-id"}
+                    "CLIENT_ID": "client-id", "TAG_ENV": "env"}
         require(steps[0].get("env") == {k: "${{ inputs." + v + " }}" for k, v in expected.items()},
                 "validation must read every input through env")
         plan_run = steps[0].get("run", "")
         require('"$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main' in plan_run
                 and '"$TAGS" == "$IMAGE:sha-$GITHUB_SHA"' in plan_run and '"$SHA7" == "${GITHUB_SHA::7}"' in plan_run,
                 "the plan must bind the deploy to this main commit")
+        require('"$TAG_ENV" =~ ^(dev|rc|prod)$' in plan_run
+                and 'production:prod|release-candidate:rc|dev:dev)' in plan_run
+                and 'echo "tag=deployed-$TAG_ENV"' in plan_run
+                and jobs["plan"].get("outputs", {}).get("tag") == "${{ steps.plan.outputs.tag }}",
+                "the plan must bind the protection tag to the target environment")
         allowed_secrets = {"record": {"VERBANIUM_CI_PRIVATE_KEY"}, "deploy": {"TS_OAUTH_CLIENT_ID", "TS_AUDIENCE", "COOLIFY_DEPLOY_TOKEN"}}
         for name, job in jobs.items():
             text = repr(job)
@@ -461,6 +496,16 @@ def validate_reusable(workflow, kind):
                 "Coolify API deploy required")
         require(any(s.get("uses", "").startswith("tailscale/github-action@") and s.get("with", {}).get("tags") == "tag:ci"
                     for s in jobs["deploy"]["steps"]), "ephemeral tag:ci tailnet node required")
+        deploy_steps = jobs["deploy"]["steps"]
+        validate_retag_steps(deploy_steps, "needs.plan.outputs")
+        verify = next((s for s in deploy_steps if s.get("name") == "Deploy the digest in Coolify and wait for the live build"), {})
+        require('if live; then' in verify.get("run", "")
+                and '"$status" == finished' in verify.get("run", "")
+                and 'does not report $SHA7 five minutes after the deploy finished"; exit 1' in verify.get("run", ""),
+                "Coolify and live commit verification must fail closed")
+        checkout = next(s for s in deploy_steps if s.get("uses", "").startswith("actions/checkout@"))
+        require(deploy_steps.index(verify) < deploy_steps.index(checkout),
+                "live verification must precede checkout and retag")
     elif kind == "merge":
         require(set(jobs) == {"merge"}, "one merge job required")
         secrets = call.get("secrets", {})

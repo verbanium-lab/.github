@@ -6,3 +6,11 @@ paths:
       # commit; actionlint 1.7.12 does not know it yet
       # (rhysd/actionlint#707). Remove this entry once the pinned actionlint supports them.
       - 'property "workflow_sha" is not defined in object type'
+  .github/workflows/deploy-coolify.yml:
+    ignore:
+      # Same documented job context and pinned-linter limitation as status.yml above.
+      - 'property "workflow_sha" is not defined in object type'
+  .github/workflows/deployed-tag.yml:
+    ignore:
+      # Same documented job context and pinned-linter limitation as status.yml above.
+      - 'property "workflow_sha" is not defined in object type'

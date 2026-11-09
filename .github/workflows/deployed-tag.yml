@@ -132,31 +132,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$ACTOR" --password-stdin
+      - name: Check out retag script
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: verbanium-lab/.github
+          ref: ${{ job.workflow_sha }} # This reusable workflow's reviewed commit, never caller code.
+          path: _github-defaults
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: .github/scripts/retag-deployed.sh
       - name: Retag the deployed digest and verify
         env:
           IMAGE: ${{ steps.plan.outputs.image }}
           DIGEST: ${{ steps.plan.outputs.digest }}
           TAG: ${{ steps.plan.outputs.tag }}
         run: |
-          # Revalidate: this step must not trust earlier step output.
-          [[ "$IMAGE" =~ ^ghcr\.io/verbanium-lab/[a-z0-9]+([._/-][a-z0-9]+)*$ ]]
-          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
-          [[ "$TAG" =~ ^deployed-(dev|rc|prod)$ ]]
-          # Manifest copy by digest: no layer pull, and the OCI index is kept as it is.
-          docker buildx imagetools create --tag "$IMAGE:$TAG" "$IMAGE@$DIGEST"
-          actual="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')"
-          {
-            echo "### Deployed tag"
-            echo
-            echo "- Tag: \`$IMAGE:$TAG\`"
-            echo "- Expected digest: \`$DIGEST\`"
-            echo "- Tag digest: \`$actual\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-          if [[ "$actual" != "$DIGEST" ]]; then
-            echo "::error::$TAG does not point at the requested digest"
-            exit 1
-          fi
-          echo "- Result: match" >> "$GITHUB_STEP_SUMMARY"
+          bash _github-defaults/.github/scripts/retag-deployed.sh
       - name: Record GitHub Deployment
         env:
           GH_TOKEN: ${{ github.token }}
