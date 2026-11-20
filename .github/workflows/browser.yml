@@ -174,7 +174,7 @@ jobs:
       contents: read
       packages: read
     container:
-      image: ${{ needs.image.outputs.tag }}
+      image: ${{ needs.image.outputs.tag }} # zizmor: ignore[unpinned-images] tag is allow-listed to mcr.microsoft.com/playwright:v<version>-noble and version-checked against the installed package; digest pin follows with @verbanium-lab/browser-testing 0.2.0
       # Playwright's advice for Chromium in a container.
       options: --init --ipc=host
     # With a job container the service is reached by its label, `postgres`, on the port Postgres
@@ -182,7 +182,7 @@ jobs:
     # starts no service.
     services:
       postgres:
-        image: ${{ inputs.postgres && inputs.postgres-image || '' }}
+        image: ${{ inputs.postgres && inputs.postgres-image || '' }} # zizmor: ignore[unpinned-images] the input is checked for @sha256: in the first browser step
         env:
           POSTGRES_USER: ${{ inputs.postgres-user }}
           POSTGRES_PASSWORD: ${{ inputs.postgres-password }}
@@ -216,6 +216,11 @@ jobs:
           # An empty image starts no service, so this is the only place that notices.
           if [ "$POSTGRES" = true ] && [ -z "$POSTGRES_IMAGE" ]; then
             echo "::error::postgres is true: set postgres-image, pinned by digest"
+            exit 1
+          fi
+          # The service image is a dynamic expression, so zizmor cannot see a digest in it; this is the check.
+          if [ "$POSTGRES" = true ] && [[ ! "$POSTGRES_IMAGE" =~ ^[A-Za-z0-9._/:-]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::postgres-image must be pinned by digest: name:tag@sha256:<64 hex>"
             exit 1
           fi
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

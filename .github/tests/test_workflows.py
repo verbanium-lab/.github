@@ -619,6 +619,13 @@ class BrowserWorkflowTests(unittest.TestCase):
         self.assertEqual(self.inputs(STUB_COMMAND='x', POSTGRES='true', POSTGRES_IMAGE=digest).returncode, 0)
         self.assertEqual(self.inputs(STUB_COMMAND='x', POSTGRES_IMAGE=digest).returncode, 0)
 
+    def test_postgres_image_must_carry_a_digest(self):
+        for image in ('postgres:18.6', 'postgres@sha256:abc', 'postgres:18.6@sha256:' + 'A' * 64,
+                      'postgres:18.6@sha256:' + 'a' * 64 + ' --privileged', 'postgres:18.6@sha256:' + 'a' * 64 + '\n'):
+            with self.subTest(image=image):
+                result = self.inputs(STUB_COMMAND='x', POSTGRES='true', POSTGRES_IMAGE=image)
+                self.assertNotEqual(result.returncode, 0)
+
 
 class StatusWorkflowTests(unittest.TestCase):
     """Option C (2026-11-01): the README commit is opt-in."""

@@ -1078,8 +1078,15 @@ Playwright image would need apt as well. The service container costs one image p
 parallel with the job container.
 
 An empty `image` starts no service; that is how `postgres: false` works. The first step of the job
-fails when `postgres` is true and `postgres-image` is empty. This relies on runner behaviour that
-needs a real run (see below).
+fails when `postgres` is true and `postgres-image` is empty or has no `@sha256:<64 hex>` digest. This
+relies on runner behaviour that needs a real run (see below).
+
+zizmor reports `unpinned-images` for both `container.image` and the service image, because each is
+a dynamic expression. Both lines carry a reviewed `# zizmor: ignore[unpinned-images]`. The Postgres
+image is checked for a digest by the first step. The Playwright tag is allow-listed to
+`mcr.microsoft.com/playwright:v<version>-noble` and compared with the installed Playwright version, but
+it is a tag, not a digest. Follow-up: export a digest from `@verbanium-lab/browser-testing` (0.2.0)
+and pin the container by digest, then drop the ignore.
 
 ### Caller example
 
