@@ -154,7 +154,8 @@ class DefaultsTests(unittest.TestCase):
     def reusable(self, kind):
         name = {'image': 'image', 'cleanup': 'ghcr-cleanup', 'deployed': 'deployed-tag',
                 'release': 'release', 'notify': 'release-notify', 'status': 'status',
-                'deploy': 'deploy-coolify', 'merge': 'release-pr-merge', 'automerge': 'risk-low-automerge'}[kind]
+                'deploy': 'deploy-coolify', 'merge': 'release-pr-merge', 'automerge': 'risk-low-automerge',
+                'browser': 'browser'}[kind]
         workflow = validator.load_yaml(ROOT / f'.github/workflows/{name}.yml')
         # Synthetic pinned references isolate boundary rejection tests from the offline pin gate.
         for job in workflow['jobs'].values():
@@ -165,7 +166,7 @@ class DefaultsTests(unittest.TestCase):
         return workflow
 
     def test_reusable_rejects_unpinned_actions_and_interpolation(self):
-        for kind in ('image', 'cleanup', 'deployed', 'release', 'notify', 'status', 'deploy'):
+        for kind in ('image', 'cleanup', 'deployed', 'release', 'notify', 'status', 'deploy', 'browser'):
             workflow = self.reusable(kind)
             for job in workflow['jobs'].values():
                 for step in job.get('steps', []):
@@ -181,7 +182,8 @@ class DefaultsTests(unittest.TestCase):
                 validator.validate_reusable(workflow, kind)
 
     def test_reusable_runner_input_contract(self):
-        kinds = ('image', 'cleanup', 'deployed', 'release', 'notify', 'status', 'deploy', 'merge', 'automerge')
+        kinds = ('image', 'cleanup', 'deployed', 'release', 'notify', 'status', 'deploy', 'merge', 'automerge',
+                 'browser')
         for kind in kinds:
             workflow = self.reusable(kind)
             runner = workflow[True]['workflow_call']['inputs']['runs-on']
@@ -379,6 +381,72 @@ class DefaultsTests(unittest.TestCase):
             with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
                 validator.validate_reusable(workflow, 'status')
 
+
+    def test_browser_boundary_rejections(self):
+        self.assertIsNone(validator.validate_reusable(self.reusable('browser'), 'browser'))
+
+        def step(workflow, job, name):
+            return next(s for s in workflow['jobs'][job]['steps'] if s.get('name') == name)
+
+        def tag_step(workflow):
+            return next(s for s in workflow['jobs']['image']['steps'] if s.get('id') == 'tag')
+
+        def inputs(workflow):
+            return workflow[True]['workflow_call']['inputs']
+
+        for mutate in (
+            lambda w: w['jobs']['browser']['container'].update(options='--ipc=host'),
+            lambda w: w['jobs']['browser']['container'].update(options='--init'),
+            lambda w: w['jobs']['browser']['container'].update(image='mcr.microsoft.com/playwright:v1.0.0-noble'),
+            lambda w: w['jobs']['browser'].pop('container'),
+            lambda w: w['jobs']['image'].update(container={'image': 'ubuntu:24.04'}),
+            lambda w: w['jobs']['browser'].update(needs=[]),
+            lambda w: w['jobs']['browser']['services']['postgres'].update(ports=['5432:5432']),
+            lambda w: w['jobs']['browser']['services']['postgres'].update(image='postgres:18'),
+            lambda w: w['jobs']['browser'].update({'timeout-minutes': 30}),
+            lambda w: w['jobs']['image'].update({'timeout-minutes': 60}),
+            lambda w: w['jobs']['browser']['permissions'].update(contents='write'),
+            lambda w: w['jobs']['image']['permissions'].update({'id-token': 'write'}),
+            lambda w: tag_step(w).update(run=tag_step(w)['run'].replace('-noble$', '-noble')),
+            lambda w: tag_step(w).update(run=tag_step(w)['run'].replace('mcr\\.microsoft\\.com/playwright:v', '.*:v')),
+            lambda w: step(w, 'browser', 'Check the inputs').update(env={'TOKEN': '${{ secrets.npm-token }}'}),
+            lambda w: step(w, 'browser', 'Stub-backend suite').update(
+                env={'COMMAND': '${{ inputs.stub-command }}', 'TOKEN': '${{ github.token }}'}),
+            lambda w: step(w, 'browser', 'Install dependencies')['env'].update(NODE_AUTH_TOKEN='${{ secrets.other }}'),
+            lambda w: step(w, 'image', 'Install the browser-testing package').update(
+                run='pnpm install --filter "$PACKAGE_FILTER"'),
+            lambda w: step(w, 'browser', 'Full-stack suite').update(run='bash -c "$COMMAND"'),
+            lambda w: step(w, 'browser', 'Stub-backend suite').update(run='echo "${{ inputs.stub-command }}"'),
+            lambda w: inputs(w).pop('stack-command'),
+            lambda w: inputs(w).update({'extra': {'type': 'string'}}),
+            lambda w: inputs(w)['package-filter'].update(required=False),
+            lambda w: inputs(w)['postgres'].update(default=True),
+            lambda w: inputs(w)['timeout-minutes'].update(default=120),
+            lambda w: inputs(w)['timeout-minutes'].update(type='string'),
+            lambda w: w[True]['workflow_call'].update(secrets={'npm-token': {'required': True}}),
+            lambda w: w[True]['workflow_call'].update(secrets={'npm-token': {}, 'other': {}}),
+            lambda w: w[True]['workflow_call'].pop('secrets'),
+        ):
+            workflow = self.reusable('browser')
+            mutate(workflow)
+            with self.subTest(workflow=workflow), self.assertRaises(validator.Invalid):
+                validator.validate_reusable(workflow, 'browser')
+
+    def test_browser_caller_example_matches_the_workflow(self):
+        import re
+        import yaml
+        section = (ROOT / 'docs/reusable-workflows.md').read_text().split('\n## Browser suites\n', 1)[1]
+        blocks = [b for b in re.findall(r'```yaml\n(.*?)```', section, re.DOTALL) if '/browser.yml@' in b]
+        self.assertEqual(len(blocks), 1)
+        calls = [j for j in yaml.safe_load(blocks[0])['jobs'].values() if '/browser.yml@' in j['uses']]
+        self.assertEqual(len(calls), 2)
+        declared = self.reusable('browser')[True]['workflow_call']
+        required = {name for name, field in declared['inputs'].items() if field.get('required')}
+        for job in calls:
+            self.assertLessEqual(set(job['with']), set(declared['inputs']))
+            self.assertLessEqual(required, set(job['with']))
+            self.assertLessEqual(set(job.get('secrets', {})), set(declared['secrets']))
+            self.assertEqual(job['permissions'], {'contents': 'read', 'packages': 'read'})
 
     def test_risk_low_automerge_boundary_rejections(self):
         self.assertIsNone(validator.validate_reusable(self.reusable('automerge'), 'automerge'))

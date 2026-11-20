@@ -1,0 +1,296 @@
+name: Reusable browser suites in the pinned Playwright container
+
+# Two jobs. `image` reads the container tag from the installed @verbanium-lab/browser-testing
+# (`browser-testing image`), because `container.image` is read before any step of its own job runs.
+# `browser` runs the caller's commands inside that image: the browsers and system libraries are
+# already there, so there is no apt step and no `playwright install`. Runner labels, Postgres and
+# artifacts: docs/reusable-workflows.md#browser-suites.
+
+on:
+  workflow_call:
+    inputs:
+      package-filter:
+        description: pnpm filter of the package that has @verbanium-lab/browser-testing as a dependency and runs the specs
+        required: true
+        type: string
+      stub-command:
+        description: >-
+          Shell command for the suite against a stubbed backend (after install). Empty: skipped.
+          At least one of stub-command and stack-command is required
+        default: ''
+        type: string
+      stack-command:
+        description: >-
+          Shell command for the full-stack suite (after install, and after stub-command). Empty: skipped.
+          It sees DATABASE_HOST and the other DATABASE_* variables when postgres is true
+        default: ''
+        type: string
+      postgres:
+        description: Start a disposable Postgres service. Inside the job container its host is `postgres`, not localhost
+        default: false
+        type: boolean
+      postgres-image:
+        description: Postgres image pinned by digest (name:tag@sha256:...). Required when postgres is true
+        default: ''
+        type: string
+      postgres-user:
+        description: Disposable database user (synthetic value, not a secret)
+        default: postgres
+        type: string
+      postgres-password:
+        description: Disposable database password (synthetic value, not a secret)
+        default: postgres
+        type: string
+      postgres-db:
+        description: Disposable database name
+        default: postgres
+        type: string
+      postgres-port:
+        description: Port Postgres listens on inside the service container; passed to the commands as DATABASE_PORT
+        default: 5432
+        type: number
+      node-version-file:
+        description: File with the Node.js version, relative to the repository root
+        default: .node-version
+        type: string
+      job-name:
+        description: Name of the browser job, so a required-check name stays stable
+        default: browser
+        type: string
+      artifact-prefix:
+        description: Artifact name prefix; use a different one for each call in a workflow run
+        default: browser
+        type: string
+      results-path:
+        description: >-
+          Newline-separated paths, relative to the repository root, of Playwright reports and test results.
+          Uploaded when the job fails. Avoid ** patterns: they walk node_modules
+        default: |
+          test-results/
+          playwright-report/
+        type: string
+      screenshots-path:
+        description: Newline-separated paths of screenshots, uploaded on every run that is not cancelled
+        default: test-results/screenshots/
+        type: string
+      runs-on:
+        description: >-
+          Runner label for the browser job, e.g. vars.CI_RUNS_ON_HEAVY. Fork pull requests always run on
+          ubuntu-24.04
+        default: ubuntu-24.04
+        type: string
+      runs-on-image:
+        description: >-
+          Runner label for the image job, which only installs the package and prints a tag, e.g. vars.CI_RUNS_ON.
+          Fork pull requests always run on ubuntu-24.04
+        default: ubuntu-24.04
+        type: string
+      timeout-minutes:
+        description: Timeout of the browser job
+        default: 30
+        type: number
+    secrets:
+      npm-token:
+        description: >-
+          Token that reads @verbanium-lab packages from GitHub Packages. Optional: the job's own
+          GITHUB_TOKEN (packages: read) is used when it is absent
+        required: false
+    outputs:
+      image:
+        description: The Playwright container image the browser job ran in
+        value: ${{ jobs.image.outputs.tag }}
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  image:
+    name: image
+    # Fork pull request code never runs on a self-hosted runner, whatever the caller passes.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || inputs.runs-on-image }}
+    timeout-minutes: 15
+    # packages: read is for the job's own token, the fallback when the caller passes no npm-token.
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          package-manager-cache: false
+      # pnpm comes from the packageManager field of the root package.json. Node 25 and later do not
+      # ship corepack; then the same version is installed with npm.
+      - name: Set up pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          version="$(node -e 'const m = /^pnpm@(\d+\.\d+\.\d+)/.exec(require("./package.json").packageManager ?? ""); process.stdout.write(m ? m[1] : "")')"
+          if [ -z "$version" ]; then
+            echo "::error::package.json must set packageManager to pnpm@<version>"
+            exit 1
+          fi
+          if command -v corepack >/dev/null 2>&1; then
+            corepack enable pnpm
+          else
+            npm install --global "pnpm@$version"
+          fi
+          pnpm --version
+      # Only the selected package: the tag needs no other dependency. The registry token is
+      # step-scoped, and pnpm 12 reads it from its auth setting, not from the repository .npmrc.
+      - name: Install the browser-testing package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.npm-token || github.token }}
+          pnpm_config__auth: '{"https://npm.pkg.github.com":{"@verbanium-lab":{"authToken":"${NODE_AUTH_TOKEN}"}}}'
+          PACKAGE_FILTER: ${{ inputs.package-filter }}
+        run: pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile --filter "$PACKAGE_FILTER"
+      # The tag goes into container.image of the next job, so only a Playwright image on MCR passes.
+      - name: Read the image tag from the installed package
+        id: tag
+        env:
+          PACKAGE_FILTER: ${{ inputs.package-filter }}
+        run: |
+          tag="$(pnpm --filter "$PACKAGE_FILTER" --fail-if-no-match exec browser-testing image)"
+          if [[ ! "$tag" =~ ^mcr\.microsoft\.com/playwright:v[0-9][0-9A-Za-z.+_-]*-noble$ ]]; then
+            echo "::error::browser-testing image did not print one mcr.microsoft.com/playwright:v<version>-noble tag"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Playwright image: \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+  browser:
+    name: ${{ inputs.job-name }}
+    needs: image
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ${{ needs.image.outputs.tag }}
+      # Playwright's advice for Chromium in a container.
+      options: --init --ipc=host
+    # With a job container the service is reached by its label, `postgres`, on the port Postgres
+    # listens on in its own container; there is no published port and no 127.0.0.1. An empty image
+    # starts no service.
+    services:
+      postgres:
+        image: ${{ inputs.postgres && inputs.postgres-image || '' }}
+        env:
+          POSTGRES_USER: ${{ inputs.postgres-user }}
+          POSTGRES_PASSWORD: ${{ inputs.postgres-password }}
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+          PGPORT: ${{ inputs.postgres-port }}
+        options: >-
+          --health-cmd "pg_isready -U ${{ inputs.postgres-user }} -d ${{ inputs.postgres-db }} -p ${{ inputs.postgres-port }}"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CI: "true"
+      DATABASE_HOST: ${{ inputs.postgres && 'postgres' || '' }}
+      DATABASE_PORT: ${{ inputs.postgres && inputs.postgres-port || '' }}
+      DATABASE_USER: ${{ inputs.postgres && inputs.postgres-user || '' }}
+      DATABASE_PASSWORD: ${{ inputs.postgres && inputs.postgres-password || '' }}
+      DATABASE_NAME: ${{ inputs.postgres && inputs.postgres-db || '' }}
+      DATABASE_URL: ${{ inputs.postgres && format('postgresql://{0}:{1}@postgres:{2}/{3}', inputs.postgres-user, inputs.postgres-password, inputs.postgres-port, inputs.postgres-db) || '' }}
+    steps:
+      - name: Check the inputs
+        env:
+          STUB_COMMAND: ${{ inputs.stub-command }}
+          STACK_COMMAND: ${{ inputs.stack-command }}
+          POSTGRES: ${{ inputs.postgres }}
+          POSTGRES_IMAGE: ${{ inputs.postgres-image }}
+        run: |
+          if [ -z "$STUB_COMMAND" ] && [ -z "$STACK_COMMAND" ]; then
+            echo "::error::set stub-command, stack-command or both"
+            exit 1
+          fi
+          # An empty image starts no service, so this is the only place that notices.
+          if [ "$POSTGRES" = true ] && [ -z "$POSTGRES_IMAGE" ]; then
+            echo "::error::postgres is true: set postgres-image, pinned by digest"
+            exit 1
+          fi
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          package-manager-cache: false
+      - name: Set up pnpm
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          version="$(node -e 'const m = /^pnpm@(\d+\.\d+\.\d+)/.exec(require("./package.json").packageManager ?? ""); process.stdout.write(m ? m[1] : "")')"
+          if [ -z "$version" ]; then
+            echo "::error::package.json must set packageManager to pnpm@<version>"
+            exit 1
+          fi
+          if command -v corepack >/dev/null 2>&1; then
+            corepack enable pnpm
+          else
+            npm install --global "pnpm@$version"
+          fi
+          pnpm --version
+      # Same install as the repository's own CI: scripts are off, then only the build scripts that
+      # pnpm-workspace.yaml allows run. The registry token is step-scoped.
+      - name: Install dependencies
+        id: install
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.npm-token || github.token }}
+          pnpm_config__auth: '{"https://npm.pkg.github.com":{"@verbanium-lab":{"authToken":"${NODE_AUTH_TOKEN}"}}}'
+        run: pnpm install --frozen-lockfile --ignore-scripts --ignore-pnpmfile
+      - name: Run the allowed build scripts
+        id: rebuild
+        run: pnpm rebuild
+      # The container has the browsers of one Playwright version. A second Playwright in the site's
+      # tree would not match them; say so here, not as a missing executable in the suite.
+      - name: Playwright matches the container image
+        env:
+          IMAGE: ${{ needs.image.outputs.tag }}
+          PACKAGE_FILTER: ${{ inputs.package-filter }}
+        run: |
+          expected="${IMAGE##*:v}"
+          expected="${expected%-noble}"
+          actual="$(pnpm --filter "$PACKAGE_FILTER" --fail-if-no-match exec browser-testing playwright --version | awk '{print $2}')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::installed Playwright is $actual, the image has $expected"
+            exit 1
+          fi
+      - name: Stub-backend suite
+        id: stub
+        if: ${{ inputs.stub-command != '' }}
+        env:
+          COMMAND: ${{ inputs.stub-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+      # After the stub suite (they may share ports) and also when it failed, so one run reports both.
+      - name: Full-stack suite
+        id: stack
+        if: ${{ !cancelled() && steps.rebuild.outcome == 'success' && inputs.stack-command != '' }}
+        env:
+          COMMAND: ${{ inputs.stack-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+      - name: Upload reports and test results
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.artifact-prefix }}-results-${{ github.run_attempt }}
+          path: ${{ inputs.results-path }}
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload screenshots
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.artifact-prefix }}-screenshots-${{ github.run_attempt }}
+          path: ${{ inputs.screenshots-path }}
+          if-no-files-found: ignore
+          retention-days: 14
