@@ -522,6 +522,111 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
 
 
+def embedded_shell(path, step):
+    """The `run: |` block of one named step, dedented."""
+    text = (ROOT / path).read_text().split('- name: ' + step + '\n', 1)[1]
+    match = re.search(r'(?m)^( +)run: \|\n((?:\1  .*\n|[ \t]*\n)+)', text)
+    if not match:
+        raise AssertionError('Shell run block not found')
+    return textwrap.dedent(match[2])
+
+
+BROWSER = '.github/workflows/browser.yml'
+BROWSER_INPUTS = embedded_shell(BROWSER, 'Check the inputs')
+BROWSER_TAG = embedded_shell(BROWSER, 'Read the image tag from the installed package')
+BROWSER_VERSION = embedded_shell(BROWSER, 'Playwright matches the container image')
+
+
+def run_shell(script, env, fake_pnpm=''):
+    """Run a step script the way the runner does (bash -eo pipefail), with a fake pnpm first on PATH."""
+    with tempfile.TemporaryDirectory() as tmp:
+        bin_dir = Path(tmp) / 'bin'
+        bin_dir.mkdir()
+        (bin_dir / 'pnpm').write_text('#!/bin/sh\n' + fake_pnpm + '\n')
+        (bin_dir / 'pnpm').chmod(0o755)
+        output, summary = Path(tmp) / 'output', Path(tmp) / 'summary'
+        output.touch()
+        summary.touch()
+        result = subprocess.run(['bash', '-eo', 'pipefail', '-c', script], capture_output=True, text=True,
+                                env=dict(PATH=f'{bin_dir}:{os.environ["PATH"]}', GITHUB_OUTPUT=str(output),
+                                         GITHUB_STEP_SUMMARY=str(summary), **env))
+        return result, output.read_text()
+
+
+class BrowserWorkflowTests(unittest.TestCase):
+    """The shell steps of browser.yml against a fake pnpm; the container itself needs a real run."""
+
+    TAG = 'mcr.microsoft.com/playwright:v1.65.1-noble'
+    PRINT_OUTPUT = 'printf "%s" "$FAKE_OUTPUT"'
+
+    def tag(self, printed):
+        return run_shell(BROWSER_TAG, dict(PACKAGE_FILTER='@verbanium-lab/example-web', FAKE_OUTPUT=printed),
+                         self.PRINT_OUTPUT)
+
+    def test_the_image_tag_becomes_the_job_output(self):
+        for printed in (self.TAG, self.TAG + '\n', 'mcr.microsoft.com/playwright:v1.66.0-alpha-2026-11-19-noble'):
+            with self.subTest(printed=printed):
+                result, output = self.tag(printed)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(github_output(output), {'tag': printed.strip()})
+
+    def test_only_a_playwright_image_on_mcr_can_become_the_container(self):
+        for printed in (
+            '', 'ubuntu:24.04', 'docker.io/library/alpine:latest',
+            'mcr.microsoft.com/playwright:v1.65.1-jammy',
+            'mcr.microsoft.com/playwright:1.65.1-noble',
+            'mcr.microsoft.com/playwright:v1.65.1-noble --privileged',
+            'mcr.example.com/mcr.microsoft.com/playwright:v1.65.1-noble',
+            'mcr.microsoft.com/playwright:v1.65.1-noble\nmcr.microsoft.com/playwright:v1.64.0-noble',
+            self.TAG + '\ntag=mcr.microsoft.com/playwright:v1.0.0-noble',
+        ):
+            with self.subTest(printed=printed):
+                result, output = self.tag(printed)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(output, '')
+
+    def test_a_failing_cli_fails_the_step(self):
+        result, output = run_shell(BROWSER_TAG, dict(PACKAGE_FILTER='x'), 'exit 3')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(output, '')
+
+    def version(self, image, installed):
+        return run_shell(BROWSER_VERSION, dict(IMAGE=image, PACKAGE_FILTER='x', FAKE_VERSION=installed),
+                         'printf "Version %s\\n" "$FAKE_VERSION"')
+
+    def test_installed_playwright_must_match_the_image(self):
+        result, _ = self.version(self.TAG, '1.65.1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result, _ = self.version('mcr.microsoft.com/playwright:v1.66.0-alpha-2026-11-19-noble', '1.66.0-alpha-2026-11-19')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result, _ = self.version(self.TAG, '1.64.0')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('installed Playwright is 1.64.0, the image has 1.65.1', result.stdout)
+
+    def inputs(self, **env):
+        values = dict(STUB_COMMAND='', STACK_COMMAND='', POSTGRES='false', POSTGRES_IMAGE='')
+        values.update(env)
+        return run_shell(BROWSER_INPUTS, values)[0]
+
+    def test_a_call_needs_a_command(self):
+        self.assertNotEqual(self.inputs().returncode, 0)
+        self.assertEqual(self.inputs(STUB_COMMAND='pnpm test').returncode, 0)
+        self.assertEqual(self.inputs(STACK_COMMAND='pnpm test').returncode, 0)
+
+    def test_postgres_needs_a_pinned_image_because_an_empty_image_starts_no_service(self):
+        digest = 'postgres:18.6@sha256:' + 'a' * 64
+        self.assertNotEqual(self.inputs(STUB_COMMAND='x', POSTGRES='true').returncode, 0)
+        self.assertEqual(self.inputs(STUB_COMMAND='x', POSTGRES='true', POSTGRES_IMAGE=digest).returncode, 0)
+        self.assertEqual(self.inputs(STUB_COMMAND='x', POSTGRES_IMAGE=digest).returncode, 0)
+
+    def test_postgres_image_must_carry_a_digest(self):
+        for image in ('postgres:18.6', 'postgres@sha256:abc', 'postgres:18.6@sha256:' + 'A' * 64,
+                      'postgres:18.6@sha256:' + 'a' * 64 + ' --privileged', 'postgres:18.6@sha256:' + 'a' * 64 + '\n'):
+            with self.subTest(image=image):
+                result = self.inputs(STUB_COMMAND='x', POSTGRES='true', POSTGRES_IMAGE=image)
+                self.assertNotEqual(result.returncode, 0)
+
+
 class StatusWorkflowTests(unittest.TestCase):
     """Option C (2026-11-01): the README commit is opt-in."""
 

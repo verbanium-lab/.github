@@ -2,7 +2,7 @@
 title: Public organization defaults
 owner: verbanium
 status: active
-last_reviewed: 2026-11-09
+last_reviewed: 2026-11-20
 ---
 
 # .github
@@ -36,6 +36,7 @@ local check and the owner-controlled activation steps.
 | [deploy-coolify.yml](.github/workflows/deploy-coolify.yml) | Deploys a main image digest to a Coolify application over an ephemeral tailnet node, records the GitHub Deployment, verifies the live build, protects the digest with `deployed-<env>` |
 | [risk-low-automerge.yml](.github/workflows/risk-low-automerge.yml) | Enables squash auto-merge for `risk:low` agent pull requests when CI, AI review and path guards pass |
 | [release-notify.yml](.github/workflows/release-notify.yml) | Telegram notice for every `<component>-vX.Y.Z` tag that release-please created in the caller |
+| [browser.yml](.github/workflows/browser.yml) | Runs a site's Playwright suites in the container image that matches the Playwright of `@verbanium-lab/browser-testing`, with an optional Postgres service; no apt step, no `playwright install` |
 | [release.yml](.github/workflows/release.yml) | **Deprecated** (one SemVer scheme, ADR 0009 amendment 2026-11-01 b): date-sha release per main image; no callers left |
 
 See [caller recipes and adoption requirements](docs/reusable-workflows.md) for fixed-app wiki and
@@ -45,7 +46,8 @@ must be completed before adoption. This change does not migrate any app caller.
 ## Runners (self-hosted bench-01)
 
 Every reusable workflow takes an optional `runs-on` input (default `ubuntu-24.04`) for all of its
-jobs; `image.yml` also takes `runs-on-arm64` (default `ubuntu-24.04-arm`). Without them nothing
+jobs; `image.yml` also takes `runs-on-arm64` (default `ubuntu-24.04-arm`) and `browser.yml` takes
+`runs-on-image` for its light job. Without them nothing
 changes. Owner decision 2026-11-09: image builds, release notices and the small service jobs may
 run on the self-hosted bench-01 runners. This replaces "jobs with write tokens stay GitHub-hosted".
 Conditions: one ephemeral VM per job, only the job-scoped `GITHUB_TOKEN` (no other secrets in image
@@ -63,6 +65,18 @@ tailnet. Callers decode the JSON organization variable:
 Fallback: delete `CI_RUNS_ON` and `CI_RUNS_ON_HEAVY` (or set them to `"ubuntu-24.04"`) and the
 next runs are GitHub-hosted again. Details, the image caller and arm64 notes:
 [Runners](docs/reusable-workflows.md#runners).
+
+## Browser suites
+
+`browser.yml` runs a site's browser tests inside `mcr.microsoft.com/playwright:v<version>-noble`.
+The `image` job reads the tag from the installed `@verbanium-lab/browser-testing`
+(`browser-testing image`); the `browser` job runs in that image with `--init --ipc=host`, installs
+the dependencies, then runs the caller's `stub-command` and `stack-command`. Postgres is an optional
+service: inside the job container its host is `postgres`, not `localhost`, and the commands get
+`DATABASE_HOST` and the other `DATABASE_*` variables. It works for `pull_request`, `push` and
+`merge_group`. Pass `runs-on` from `CI_RUNS_ON_HEAVY` and `runs-on-image` from `CI_RUNS_ON`. Inputs,
+caller example, networking and what needs a real run:
+[the guide](docs/reusable-workflows.md#browser-suites).
 
 ## Risk low auto-merge
 

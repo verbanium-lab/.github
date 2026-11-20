@@ -22,7 +22,7 @@ OWNED_FILES = {
     ".github/workflows/deployed-tag.yml", ".github/workflows/release.yml",
     ".github/workflows/release-notify.yml", ".github/workflows/deploy-coolify.yml",
     ".github/workflows/status.yml", ".github/workflows/release-pr-merge.yml",
-    ".github/workflows/risk-low-automerge.yml",
+    ".github/workflows/risk-low-automerge.yml", ".github/workflows/browser.yml",
     ".github/scripts/risk_low_automerge.py",
     ".github/scripts/retag-deployed.sh", ".github/tests/test_deploy_tag.py",
     ".github/scripts/collect_status.py", ".github/scripts/render_status.py",
@@ -30,7 +30,7 @@ OWNED_FILES = {
     ".github/tests/test_workflows.py", ".github/tests/test_risk_low_automerge.py",
     "docs/reusable-workflows.md",
     "lefthook.yml", ".github/scripts/hooks/pre-push.sh", ".github/scripts/hooks/staged.sh",
-    ".github/actionlint.yaml",
+    ".github/actionlint.yaml", ".github/zizmor.yml",
 }
 FIELDS = {
     "goal": ("textarea", "Goal", None),
@@ -43,6 +43,16 @@ FIELDS = {
 }
 # Retired npm scope: "@verbanium" followed by a slash, also regex-escaped. Packages use @verbanium-lab.
 RETIRED_SCOPE = re.compile(r"@verbanium\\?/")
+
+
+BROWSER_RUNS_ON = ("${{{{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name"
+                   " != github.repository) && 'ubuntu-24.04' || inputs.{} }}}}")
+BROWSER_TOKEN = "${{ secrets.npm-token || github.token }}"
+BROWSER_INPUTS = {
+    "package-filter", "stub-command", "stack-command", "postgres", "postgres-image", "postgres-user",
+    "postgres-password", "postgres-db", "postgres-port", "node-version-file", "job-name", "artifact-prefix",
+    "results-path", "screenshots-path", "timeout-minutes",
+}
 
 
 class Invalid(ValueError):
@@ -254,6 +264,8 @@ def validate_runners(call, jobs, kind):
     defaults = {"runs-on": "ubuntu-24.04"}
     if kind == "image":
         defaults["runs-on-arm64"] = "ubuntu-24.04-arm"
+    if kind == "browser":
+        defaults["runs-on-image"] = "ubuntu-24.04"
     declared = call.get("inputs") or {}
     require(isinstance(declared, dict), "reusable inputs must be a mapping")
     for name, default in defaults.items():
@@ -263,6 +275,9 @@ def validate_runners(call, jobs, kind):
     for name, job in jobs.items():
         matrix = kind == "image" and name in ("build", "push")
         expected = "${{ matrix.runner }}" if matrix else "${{ inputs.runs-on }}"
+        if kind == "browser":
+            # Fork pull request code never reaches a self-hosted runner, whatever the caller passes.
+            expected = BROWSER_RUNS_ON.format("runs-on-image" if name == "image" else "runs-on")
         require(job.get("runs-on") == expected, "jobs must run on the runner input")
         # Runner inputs choose a machine only; they never reach a step.
         require("inputs.runs-on" not in repr(job.get("steps", [])) or (kind == "image" and name == "plan"),
@@ -289,11 +304,17 @@ def validate_reusable(workflow, kind):
         "status": {"actions/checkout", "actions/download-artifact"},
         "merge": {"actions/create-github-app-token"},
         "automerge": {"actions/checkout", "actions/create-github-app-token"},
+        "browser": {"actions/checkout", "actions/setup-node", "actions/upload-artifact"},
     }[kind]
-    for job in jobs.values():
+    for name, job in jobs.items():
         require(isinstance(job, dict) and "uses" not in job, "local reusable jobs required")
-        require(type(job.get("timeout-minutes")) is int and 0 < job["timeout-minutes"] <= 30,
-                "bounded reusable timeout required")
+        if kind == "browser" and name == "browser":
+            # The caller sizes the suite; the input is a number with a bounded default (checked below).
+            require(job.get("timeout-minutes") == "${{ inputs.timeout-minutes }}",
+                    "browser timeout must come from the timeout-minutes input")
+        else:
+            require(type(job.get("timeout-minutes")) is int and 0 < job["timeout-minutes"] <= 30,
+                    "bounded reusable timeout required")
         require("continue-on-error" not in job, "reusable jobs must fail closed")
         for step in job.get("steps", []):
             require(isinstance(step, dict) and "continue-on-error" not in step, "reusable steps must fail closed")
@@ -736,6 +757,60 @@ def validate_reusable(workflow, kind):
         require("createCommitOnBranch" in run, "signed commit through createCommitOnBranch required")
         require("git push" not in run, "status commit must not use git push")
         require("gh', 'pr', 'create'" in run, "status PR fallback required")
+    elif kind == "browser":
+        require(set(jobs) == {"image", "browser"}, "image and browser jobs required")
+        declared = call.get("inputs", {})
+        require(set(declared) == BROWSER_INPUTS, "browser input contract required")
+        require(declared["package-filter"].get("type") == "string" and declared["package-filter"].get("required") is True,
+                "required package-filter input required")
+        for name in ("stub-command", "stack-command", "postgres-image"):
+            field = declared[name]
+            require(field.get("type") == "string" and field.get("default") == "" and not field.get("required"),
+                    "optional empty-by-default input required: " + name)
+        postgres = declared["postgres"]
+        require(postgres.get("type") == "boolean" and postgres.get("default") is False and not postgres.get("required"),
+                "postgres must be a boolean that defaults to false")
+        timeout = declared["timeout-minutes"]
+        require(timeout.get("type") == "number" and type(timeout.get("default")) is int
+                and 0 < timeout["default"] <= 60 and not timeout.get("required"),
+                "timeout-minutes must be a number with a default of at most 60")
+        secrets = call.get("secrets") or {}
+        require(set(secrets) == {"npm-token"} and not secrets["npm-token"].get("required"),
+                "one optional npm-token secret required")
+        for name in ("image", "browser"):
+            require(jobs[name].get("permissions") == {"contents": "read", "packages": "read"},
+                    "browser job permission boundary required")
+        require("container" not in jobs["image"], "the image job runs without a container")
+        require(jobs["browser"].get("needs") == "image", "browser must wait for the image job")
+        require(jobs["browser"].get("container") == {"image": "${{ needs.image.outputs.tag }}", "options": "--init --ipc=host"},
+                "browser job must run in the tagged image with --init --ipc=host")
+        service = jobs["browser"].get("services", {}).get("postgres", {})
+        require(set(jobs["browser"].get("services", {})) == {"postgres"}
+                and service.get("image") == "${{ inputs.postgres && inputs.postgres-image || '' }}"
+                and "ports" not in service, "postgres service only when asked, reached by hostname, never published")
+        tag_step = next((s for s in jobs["image"]["steps"] if s.get("id") == "tag"), {})
+        require("mcr\\.microsoft\\.com/playwright:v" in tag_step.get("run", "") and "-noble$" in tag_step.get("run", ""),
+                "only a Playwright image on MCR may become the container")
+        require(jobs["image"].get("outputs") == {"tag": "${{ steps.tag.outputs.tag }}"}, "tag output required")
+        # The registry token enters the two install steps only; no later command sees it.
+        installs = 0
+        for name in ("image", "browser"):
+            for step in jobs[name]["steps"]:
+                text = repr(step)
+                if step.get("name") in ("Install the browser-testing package", "Install dependencies"):
+                    installs += 1
+                    require(step.get("env", {}).get("NODE_AUTH_TOKEN") == BROWSER_TOKEN
+                            and "--frozen-lockfile" in step.get("run", "") and "--ignore-scripts" in step.get("run", ""),
+                            "step-scoped token and a frozen, script-free install required")
+                else:
+                    require("secrets." not in text and "github.token" not in text, "registry token must stay in the install steps")
+        require(installs == 2, "both jobs install with the step-scoped token")
+        # Caller commands run from env only, as written, never interpolated into the script.
+        for step_id, source in (("stub", "stub-command"), ("stack", "stack-command")):
+            step = next((s for s in jobs["browser"]["steps"] if s.get("id") == step_id), {})
+            require(step.get("run") == 'bash -eo pipefail -c "$COMMAND"'
+                    and step.get("env") == {"COMMAND": "${{ inputs." + source + " }}"},
+                    "caller commands must run through env: " + source)
     else:
         require(set(jobs) == {"cleanup"}, "one cleanup job required")
         require(call.get("inputs", {}).get("dry-run", {}).get("default") is True, "cleanup dry-run default required")
@@ -776,6 +851,7 @@ def main():
         validate_reusable(load_yaml(root / ".github/workflows/status.yml"), "status")
         validate_reusable(load_yaml(root / ".github/workflows/release-pr-merge.yml"), "merge")
         validate_reusable(load_yaml(root / ".github/workflows/risk-low-automerge.yml"), "automerge")
+        validate_reusable(load_yaml(root / ".github/workflows/browser.yml"), "browser")
         if args.snapshot:
             for path in paths:
                 target = args.snapshot / path

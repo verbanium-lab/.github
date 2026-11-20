@@ -2,7 +2,7 @@
 title: Reusable image builds and registry cleanup
 owner: verbanium
 status: draft
-last_reviewed: 2026-11-09
+last_reviewed: 2026-11-20
 ---
 
 # Reusable image builds and registry cleanup
@@ -84,7 +84,8 @@ must grant the caller repository the required GHCR access.
 
 Every reusable workflow has an optional string input `runs-on`, the runner label for all of its
 jobs. It defaults to `ubuntu-24.04`, so a caller that does not set it behaves as before.
-`image.yml` also has `runs-on-arm64` (default `ubuntu-24.04-arm`) for its `linux/arm64` jobs.
+`image.yml` also has `runs-on-arm64` (default `ubuntu-24.04-arm`) for its `linux/arm64` jobs, and
+`browser.yml` has `runs-on-image` for its light tag job ([Browser suites](#browser-suites)).
 
 Owner decision 2026-11-09: publishing, release and small service jobs (image builds, release
 notices, the Release PR merge, risk-low merge, registry cleanup, the status table and tag moves)
@@ -984,3 +985,192 @@ dispatch agent's numeric user id. Add repository-specific extra globs only throu
 when needed (optional). Offline tests cover `risk_low_automerge` path matching, minimum protected
 paths, renamed files, check-run selection and `decide`; they do not prove live auto-merge or ruleset
 behavior on the caller repository.
+
+## Browser suites
+
+`.github/workflows/browser.yml` runs a site's Playwright suites inside the container image that
+matches the Playwright of `@verbanium-lab/browser-testing` (verbanium-lab/infra#337, part of the
+browser CI epic verbanium-lab/infra#338). The runner image carries no browsers or system libraries,
+so the job has no apt step and no `playwright install`: the image has the browsers of exactly the
+installed Playwright version. Callers pin the workflow by reviewed commit, like the others.
+
+Two jobs:
+
+1. `image` (light, no container) installs only the selected package and runs
+   `pnpm --filter <package-filter> exec browser-testing image`. Its output `tag` is
+   `mcr.microsoft.com/playwright:v<version>-noble`. A job's `container.image` is read before the
+   job's own steps run, so the tag has to come from an earlier job. The step accepts only a tag of
+   that shape on `mcr.microsoft.com`, so a package (or a pull request that edits one) cannot make
+   the next job run an arbitrary image.
+2. `browser` runs in that image with `--init --ipc=host` (Playwright's advice for Chromium in a
+   container). It installs the repository's dependencies, checks that the installed Playwright
+   version equals the image's, runs `stub-command` and then `stack-command`, and uploads artifacts.
+
+It works for `pull_request`, `push` and `merge_group`: it reads nothing from the event except the
+fork check below.
+
+### Inputs
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `package-filter` | required | pnpm filter of the package that depends on `@verbanium-lab/browser-testing` and runs the specs |
+| `stub-command` | empty | Shell command of the suite against a stubbed backend. Empty: skipped |
+| `stack-command` | empty | Shell command of the full-stack suite. Runs after `stub-command`, also when it failed. Empty: skipped |
+| `postgres` | `false` | Start a disposable Postgres service |
+| `postgres-image` | empty | Image pinned by digest; required when `postgres` is true |
+| `postgres-user`, `postgres-password`, `postgres-db` | `postgres` | Disposable, synthetic values (not secrets) |
+| `postgres-port` | `5432` | Port Postgres listens on inside its container |
+| `node-version-file` | `.node-version` | Node.js version file for `actions/setup-node` |
+| `job-name` | `browser` | Name of the `browser` job |
+| `artifact-prefix` | `browser` | Artifact name prefix; use one per call |
+| `results-path` | `test-results/` and `playwright-report/` | Paths uploaded when the job fails |
+| `screenshots-path` | `test-results/screenshots/` | Paths uploaded on every run that is not cancelled |
+| `runs-on` | `ubuntu-24.04` | Runner label of the `browser` job |
+| `runs-on-image` | `ubuntu-24.04` | Runner label of the `image` job |
+| `timeout-minutes` | `30` | Timeout of the `browser` job (the `image` job has 15) |
+
+Secret `npm-token` is optional: it reads `@verbanium-lab/*` from GitHub Packages. Without it the
+job's own `GITHUB_TOKEN` is used, which needs `packages: read` in the caller job and the package's
+"Manage Actions access" to include the caller repository (the consumer standard in the wiki,
+`content/system/shared-packages.md`). The token reaches only the two install steps, through pnpm's
+`pnpm_config__auth`, never the suite commands. The commands run from the repository root through
+`bash -eo pipefail -c`, so they can chain (`pnpm run build && pnpm run test:browser`) or call
+`pnpm --filter`. Paths of `results-path` and `screenshots-path` are relative to the repository root
+(`apps/web/test-results/` for an app in `apps/web`); avoid `**` patterns, which walk `node_modules`.
+`defineBrowserConfig` writes to `test-results` and keeps traces on failure.
+
+### Runners
+
+Use the same variables as the other workflows (see [Runners](#runners)). The browser job goes to the
+heavy pool, the tag job to the light one:
+
+```yaml
+      runs-on: ${{ vars.CI_RUNS_ON_HEAVY && fromJSON(vars.CI_RUNS_ON_HEAVY) || 'ubuntu-24.04' }}
+      runs-on-image: ${{ vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-24.04' }}
+```
+
+Both jobs ignore these labels for a fork pull request and run on `ubuntu-24.04`: fork code never
+reaches a self-hosted runner. Fallback during a bench incident: delete the variables, or set them to
+`"ubuntu-24.04"`, then cancel and re-run queued runs (runbook `ci-runners`). The container image is
+the same on hosted runners, which have Docker.
+
+### Postgres and container networking
+
+Inside a job container the runner puts the job container and its service containers on one Docker
+network. The service is reached by its label, **`postgres`**, on the port Postgres listens on
+(`postgres-port`); `localhost` and `127.0.0.1` are the job container itself, and published `ports:`
+are not used. So the commands get the address in the job environment:
+
+| Variable | Value with `postgres: true` |
+| --- | --- |
+| `DATABASE_HOST` | `postgres` |
+| `DATABASE_PORT`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DATABASE_NAME` | the `postgres-*` inputs |
+| `DATABASE_URL` | `postgresql://<user>:<password>@postgres:<port>/<db>` |
+
+All are empty when `postgres` is false. `postgres-port` also sets `PGPORT` of the service, so a site
+whose scripts expect another port keeps it. A site whose scripts accept only `127.0.0.1` (the
+IBLONDA database checks take `127.0.0.1:54329` today) must read `DATABASE_HOST` first: that is a
+change in the caller's scripts, not in this workflow.
+
+Why a service and not the host network: the runner refuses a custom `--network` for a job container,
+and running Chromium on the host again needs the apt step this workflow removes. Postgres inside the
+Playwright image would need apt as well. The service container costs one image pull and starts in
+parallel with the job container.
+
+An empty `image` starts no service; that is how `postgres: false` works. The first step of the job
+fails when `postgres` is true and `postgres-image` is empty or has no `@sha256:<64 hex>` digest. This
+relies on runner behaviour that needs a real run (see below).
+
+zizmor reports `unpinned-images` for both `container.image` and the service image, because each is
+a dynamic expression. Both lines carry a reviewed `# zizmor: ignore[unpinned-images]`. The Postgres
+image is checked for a digest by the first step. The Playwright tag is allow-listed to
+`mcr.microsoft.com/playwright:v<version>-noble` and compared with the installed Playwright version, but
+it is a tag, not a digest. Follow-up: export a digest from `@verbanium-lab/browser-testing` (0.2.0)
+and pin the container by digest, then drop the ignore.
+
+### Caller example
+
+```yaml
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions: {}
+
+jobs:
+  browser-stub:
+    name: browser stub
+    permissions:
+      contents: read
+      packages: read
+    uses: verbanium-lab/.github/.github/workflows/browser.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      runs-on: ${{ vars.CI_RUNS_ON_HEAVY && fromJSON(vars.CI_RUNS_ON_HEAVY) || 'ubuntu-24.04' }}
+      runs-on-image: ${{ vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-24.04' }}
+      package-filter: '@verbanium-lab/example-web'
+      job-name: browser
+      artifact-prefix: browser-stub
+      stub-command: pnpm --filter @verbanium-lab/example-web run build && pnpm --filter @verbanium-lab/example-web run test:browser
+      results-path: apps/web/test-results/
+      screenshots-path: apps/web/test-results/screenshots/
+
+  browser-stack:
+    name: browser stack
+    needs: browser-stub
+    permissions:
+      contents: read
+      packages: read
+    uses: verbanium-lab/.github/.github/workflows/browser.yml@REVIEWED_WORKFLOW_COMMIT
+    with:
+      runs-on: ${{ vars.CI_RUNS_ON_HEAVY && fromJSON(vars.CI_RUNS_ON_HEAVY) || 'ubuntu-24.04' }}
+      runs-on-image: ${{ vars.CI_RUNS_ON && fromJSON(vars.CI_RUNS_ON) || 'ubuntu-24.04' }}
+      package-filter: '@verbanium-lab/example-web'
+      job-name: browser
+      artifact-prefix: browser-stack
+      postgres: true
+      postgres-image: postgres:REVIEWED_VERSION@sha256:REVIEWED_DIGEST
+      postgres-user: example
+      postgres-db: example
+      stack-command: pnpm run e2e:process
+      results-path: apps/web/test-results/
+      screenshots-path: apps/web/test-results/screenshots/
+```
+
+The check name of a called job is `<caller job name> / <job-name>`, so it stays stable while the
+caller keeps the job name and `job-name`. Put an aggregate gate (like the `ci` job) behind these
+jobs and require only that. The suites are separate calls here because they need different
+services; one call with both commands also works when they share a configuration. A job container
+is a fresh checkout, so a suite that needs a build runs it in its command.
+
+### Not verified offline
+
+Checked offline: the workflow's shell steps (input checks, tag allowlist, version match) run against
+a fake `pnpm`, and the validator pins the job shape (see [CONTRIBUTING.md](../CONTRIBUTING.md)).
+These need a real run:
+
+- **Container start on the bench runners:** Docker in the runner VM, `--init --ipc=host`, the
+  workspace and `RUNNER_TOOL_CACHE` mounts, and `git`, `actions/checkout` and `actions/setup-node`
+  inside the Playwright image (checkout falls back to an archive download when `git` is missing,
+  and then `.git` is absent). `actions/setup-node` uses the runner's tool cache; a Node version
+  that is not in it is downloaded, which is slow on bench-01's link.
+- **Image pull through the registry cache** (verbanium-lab/infra#336): a Docker daemon mirror covers
+  Docker Hub only, so the cache has to be set up for `mcr.microsoft.com` (or the image name needs a
+  prefix). This workflow passes the tag as the package prints it. If infra#336 needs a prefix, add
+  an optional input then.
+- **An empty service `image` starts no service.** The workflow syntax reference does not say so. If
+  a real run refuses it, split the job in two (with and without the service) or always start the
+  service.
+- **pnpm setup:** the corepack path against the `npm install --global` path (Node 25 and later do
+  not ship corepack) on the repositories' Node version, and `pnpm install --filter` with
+  `--frozen-lockfile` for the tag job.
+- **Action pins:** `actions/setup-node` (v7.1.0, `949feb24…`) is copied from IBLONDA's `ci.yml` and
+  was not re-verified against the vendor tag; `actions/checkout` and `actions/upload-artifact`
+  reuse the pins of `image.yml`.
+- **`PGPORT` in the Postgres image** and the output format of `playwright --version`
+  (`Version <x.y.z>`, as IBLONDA's `awk '{print $2}'` reads it).
+- The image tag is a mutable tag, not a digest: the package owns it and the workflow checks only
+  its shape. Revisit if Playwright images are re-published under the same tag.
