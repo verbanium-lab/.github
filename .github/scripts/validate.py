@@ -30,7 +30,7 @@ OWNED_FILES = {
     ".github/tests/test_workflows.py", ".github/tests/test_risk_low_automerge.py",
     "docs/reusable-workflows.md",
     "lefthook.yml", ".github/scripts/hooks/pre-push.sh", ".github/scripts/hooks/staged.sh",
-    ".github/actionlint.yaml",
+    ".github/actionlint.yaml", ".github/zizmor.yml",
 }
 FIELDS = {
     "goal": ("textarea", "Goal", None),

@@ -140,7 +140,7 @@ jobs:
           if command -v corepack >/dev/null 2>&1; then
             corepack enable pnpm
           else
-            npm install --global "pnpm@$version" # zizmor: ignore[adhoc-packages] exact version from packageManager; only when Node ships no corepack
+            npm install --global "pnpm@$version"
           fi
           pnpm --version
       # Only the selected package: the tag needs no other dependency. The registry token is
@@ -242,7 +242,7 @@ jobs:
           if command -v corepack >/dev/null 2>&1; then
             corepack enable pnpm
           else
-            npm install --global "pnpm@$version" # zizmor: ignore[adhoc-packages] exact version from packageManager; only when Node ships no corepack
+            npm install --global "pnpm@$version"
           fi
           pnpm --version
       # Same install as the repository's own CI: scripts are off, then only the build scripts that

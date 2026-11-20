@@ -1,0 +1,7 @@
+# zizmor configuration (https://docs.zizmor.sh/configuration/).
+rules:
+  adhoc-packages:
+    ignore:
+      # The pnpm fallback for Node releases without corepack installs the exact version from the
+      # caller's packageManager field. Inline ignore comments are not read inside run: blocks.
+      - browser.yml
