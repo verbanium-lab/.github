@@ -292,13 +292,15 @@ def decide(
     if not ok:
         reasons.append(detail)
 
-    ok, detail = latest_check_success(
-        check_runs,
-        check_name=ai_review_check,
-        actions_app_id=ai_review_actions_app_id,
-    )
-    if not ok:
-        reasons.append(detail)
+    # An empty name disables the AI review requirement; any other name is required as before.
+    if ai_review_check != "":
+        ok, detail = latest_check_success(
+            check_runs,
+            check_name=ai_review_check,
+            actions_app_id=ai_review_actions_app_id,
+        )
+        if not ok:
+            reasons.append(detail)
 
     return Decision(enable_auto_merge=not reasons, reasons=tuple(reasons))
 

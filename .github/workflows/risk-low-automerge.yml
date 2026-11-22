@@ -6,8 +6,8 @@
 # to the PR requires a fresh gate run before it can merge.
 #
 # Callers pin this workflow by reviewed commit and pass gate-ref (verbanium-lab/.github script SHA)
-# plus every policy knob through inputs. The AI review check name is an input (default ai-review);
-# the check itself is produced elsewhere (engine-apps#26).
+# plus every policy knob through inputs. The AI review check name is an input (default ai-review;
+# empty disables the requirement); the check itself is produced elsewhere (engine-apps#26).
 #
 # Example caller — see docs/reusable-workflows.md#risk-low-auto-merge.
 
@@ -35,7 +35,9 @@ on:
         default: ci
         type: string
       ai-review-check:
-        description: Advisory AI reviewer check name that must succeed on the PR head
+        description: >-
+          Advisory AI reviewer check name that must succeed on the PR head; an empty value
+          disables the AI review requirement
         default: ai-review
         type: string
       low-risk-label:
@@ -192,6 +194,9 @@ jobs:
           def say(message):
               print(message)
               summary.write(message + "\n")
+
+          if os.environ["AI_REVIEW_CHECK"] == "":
+              say("AI review requirement is disabled (ai-review-check is empty); only the required check gates the merge.")
 
           def pages(path, token=None):
               env = dict(os.environ, GH_TOKEN=token) if token else None
