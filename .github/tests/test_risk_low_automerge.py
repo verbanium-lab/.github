@@ -118,6 +118,20 @@ class DecideTests(unittest.TestCase):
     def test_missing_ai_review(self):
         self.assert_skip("ai-review", check_runs=(run("ci"),))
 
+    def test_empty_ai_review_name_skips_requirement(self):
+        self.assert_enable(ai_review_check="", check_runs=(run("ci"),))
+
+    def test_empty_ai_review_name_still_requires_ci(self):
+        self.assert_skip("ci", ai_review_check="", check_runs=(run("ci", concl="failure"),))
+
+    def test_empty_ai_review_name_keeps_protected_paths(self):
+        self.assert_skip(
+            "protected path",
+            ai_review_check="",
+            check_runs=(run("ci"),),
+            changed_files=("package.json",),
+        )
+
     def test_wrong_base_branch(self):
         self.assert_skip("base branch", pr_base="develop")
 

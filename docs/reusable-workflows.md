@@ -877,7 +877,9 @@ Configure the caller ruleset so this gate job's check name (for example `Risk lo
 **required** on pull requests that may be merged by the gate. The organization `ai-review` check is
 **advisory-only** in branch rules on its own: it does not block merge unless the owner also lists it as
 required. The gate still requires both `required-check` (default `ci`) and `ai-review-check` (default
-`ai-review`) to be green on the pinned head before merging.
+`ai-review`) to be green on the pinned head before merging. A caller may set `ai-review-check: ""`
+to disable the AI review requirement; then only `required-check` gates the merge and the job summary
+says the requirement is disabled. Protected paths, author and label rules do not change.
 
 ### Trust model: what the gate does not prove
 
@@ -917,8 +919,8 @@ executes no pull request code.
   cannot remove these) union any extra globs in `protected-paths` (default empty);
 - the latest GitHub Actions check run per name (by `started_at` and `id`) for `required-check`
   (default `ci`, `actions-app-id` default `15368`) and `ai-review-check` (default `ai-review`,
-  `ai-review-actions-app-id` default `15368` for non-Actions reviewers) completed successfully on the
-  pinned PR head.
+  `ai-review-actions-app-id` default `15368` for non-Actions reviewers; an empty `ai-review-check`
+  skips this requirement) completed successfully on the pinned PR head.
 
 Baked-in minimum protected paths (always enforced): `.github/**`, `**/CODEOWNERS`, `CODEOWNERS`,
 `justfile`, `lefthook.yml`, `**/.sops.yaml`, `**/secrets/**`, `package.json`, `pnpm-lock.yaml`,
