@@ -645,6 +645,9 @@ def validate_reusable(workflow, kind):
             "ai-review-actions-app-id": ("15368", "string"),
             "base-branch": ("main", "string"),
             "protected-paths": ("", "string"),
+            "mode": ("risk-low", "string"),
+            "dependency-bot-id": ("", "string"),
+            "dependency-label": ("deps:automerge", "string"),
         }
         require(set(declared) == required | set(optional), "reviewed automerge inputs only")
         for name in required:
@@ -678,6 +681,9 @@ def validate_reusable(workflow, kind):
             "ACTIONS_APP_ID": "${{ inputs.actions-app-id }}",
             "AI_REVIEW_ACTIONS_APP_ID": "${{ inputs.ai-review-actions-app-id }}",
             "BASE_BRANCH": "${{ inputs.base-branch }}",
+            "MODE": "${{ inputs.mode }}",
+            "DEPENDENCY_BOT_ID": "${{ inputs.dependency-bot-id }}",
+            "DEPENDENCY_LABEL": "${{ inputs.dependency-label }}",
         }
         require(plan.get("id") == "plan" and plan.get("env") == expected_plan,
                 "validation must read every input through env in the plan step")
@@ -698,6 +704,8 @@ def validate_reusable(workflow, kind):
         run = " ".join(s.get("run", "") for s in steps)
         for needle in (
             "from risk_low_automerge import decide",
+            "decide_dependencies",
+            "DEPENDENCY_BOT_ID",
             "neutralize_actions_log_text",
             "paths_from_pr_files",
             '"--method", "PUT"',

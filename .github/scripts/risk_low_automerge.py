@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Pure decision logic for the risk:low auto-merge gate (unit-tested offline)."""
+"""Pure decision logic for the auto-merge gate (unit-tested offline).
+
+Two modes: `risk-low` (agent pull requests, the default) and `dependencies` (Renovate pull requests).
+"""
 
 from __future__ import annotations
 
@@ -305,9 +308,228 @@ def decide(
     return Decision(enable_auto_merge=not reasons, reasons=tuple(reasons))
 
 
+MODE_RISK_LOW = "risk-low"
+MODE_DEPENDENCIES = "dependencies"
+MODES: tuple[str, ...] = (MODE_RISK_LOW, MODE_DEPENDENCIES)
+
+# Dependency mode: the allow-list below REPLACES MINIMUM_PROTECTED_PATTERNS. The protected list
+# exists to keep third-party code out of agent pull requests, and it names exactly the files a
+# dependency update must change (package.json, lock files, Dockerfiles, workflow pins). Applying
+# both would refuse every dependency update. A path that is not on this list refuses, so the
+# allow-list is the narrower rule, not a looser one. Workflow and Dockerfile entries are checked
+# line by line (see `dependency_patch_problem`).
+DEPENDENCY_ANY_CHANGE_PATTERNS: tuple[str, ...] = (
+    "package.json",
+    "**/package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+)
+DEPENDENCY_DOCKERFILE_PATTERNS: tuple[str, ...] = ("Dockerfile*", "**/Dockerfile*")
+# `.github/workflows/*.yml`: the glob helper has no `*.yml` form, so this is a regular expression.
+DEPENDENCY_WORKFLOW_RE = re.compile(r"\.github/workflows/[^/]+\.yml", re.ASCII)
+
+_USES_LINE_RE = re.compile(
+    r"(?P<lead>[ \t]*(?:-[ \t]+)?)uses:[ \t]+(?P<name>[^\s#@]+)(?:@(?P<ref>[^\s#]+))?(?:[ \t]+#.*)?",
+    re.ASCII,
+)
+
+
+def _clean_patch_line(line: str) -> str | None:
+    """Drop one trailing CR; None when the line carries other control characters."""
+    text = line[:-1] if line.endswith("\r") else line
+    if any(ord(char) < 32 and char != "\t" for char in text):
+        return None
+    return text
+
+
+def patch_changed_lines(patch: str) -> list[tuple[str, str]] | None:
+    """Added and removed lines of a unified-diff patch as (sign, text); None if unreadable.
+
+    The API patch has no file headers, so every line that starts with + or - is a change (even
+    one that begins with +++). Only "\\n" separates lines: str.splitlines also splits on other
+    separators and could hide a line.
+    """
+    changes: list[tuple[str, str]] = []
+    for raw in patch.split("\n"):
+        if raw.startswith("@@") or raw.startswith("\\") or raw[:1] not in ("+", "-"):
+            continue
+        text = _clean_patch_line(raw[1:])
+        if text is None:
+            return None
+        changes.append((raw[0], text))
+    return changes
+
+
+def _uses_key(text: str) -> tuple[str, ...] | None:
+    """Key of a `uses:` line: everything but the version and the trailing comment."""
+    match = _USES_LINE_RE.fullmatch(text)
+    if match is None:
+        return None
+    return ("uses", match["lead"], match["name"])
+
+
+def _dockerfile_key(text: str) -> tuple[str, ...] | None:
+    """Key of a FROM or COPY --from= line: the whole line without the image digest.
+
+    A changed tag, stage name or any other part changes the key, so only a digest change pairs up.
+    """
+    tokens = [token for token in re.split(r"[ \t]+", text.strip(" \t")) if token]
+    if not tokens:
+        return None
+    head = tokens[0].upper()
+    if head == "FROM":
+        for index in range(1, len(tokens)):
+            if not tokens[index].startswith("--"):
+                tokens[index] = tokens[index].split("@", 1)[0]
+                return ("FROM", *tokens[1:])
+        return None
+    if head == "COPY":
+        found = False
+        for index, token in enumerate(tokens):
+            if token.startswith("--from="):
+                tokens[index] = token.split("@", 1)[0]
+                found = True
+        return ("COPY", *tokens[1:]) if found else None
+    return None
+
+
+def dependency_patch_problem(kind: str, patch: str | None) -> str | None:
+    """Why the line-level rule refuses this patch (kind: "uses" or "dockerfile"), else None.
+
+    Every added or removed line must be a `uses:` line (a FROM or COPY --from= line) and the
+    removed lines must pair up with the added ones, so a new step or stage cannot ride along.
+    """
+    if not patch:
+        return "no patch to check"
+    changes = patch_changed_lines(patch)
+    if changes is None:
+        return "patch contains control characters"
+    if not changes:
+        return "patch has no changed lines"
+    keyer = _uses_key if kind == "uses" else _dockerfile_key
+    removed: list[tuple[str, ...]] = []
+    added: list[tuple[str, ...]] = []
+    for sign, text in changes:
+        key = keyer(text)
+        if key is None:
+            return "changed line is not a " + ("uses: line" if kind == "uses" else "FROM or COPY --from= line")
+        (removed if sign == "-" else added).append(key)
+    if sorted(removed) != sorted(added):
+        return "added and removed lines do not pair up (only the version or digest may change)"
+    return None
+
+
+def dependency_file_problem(entry: Mapping[str, Any]) -> str | None:
+    """Why a changed file refuses in dependency mode, else None."""
+    filename = entry.get("filename")
+    if not isinstance(filename, str) or not filename:
+        return "file entry without a name"
+    if path_has_dotdot(filename):
+        return "path contains .."
+    if entry.get("status") != "modified":
+        return f"status {entry.get('status')!r} (only modified files may change)"
+    if entry.get("previous_filename"):
+        return "renamed file"
+    if any(glob_path_match(filename, pattern) for pattern in DEPENDENCY_ANY_CHANGE_PATTERNS):
+        return None
+    if DEPENDENCY_WORKFLOW_RE.fullmatch(filename):
+        return dependency_patch_problem("uses", entry.get("patch"))
+    if any(glob_path_match(filename, pattern) for pattern in DEPENDENCY_DOCKERFILE_PATTERNS):
+        return dependency_patch_problem("dockerfile", entry.get("patch"))
+    return "not on the dependency allow-list"
+
+
+def decide_dependencies(
+    *,
+    label_names: frozenset[str],
+    draft: bool,
+    author_login: str,
+    author_type: str,
+    author_id: int,
+    base_branch: str,
+    pr_base: str,
+    head_repo_full_name: str,
+    caller_repo: str,
+    files: Sequence[Mapping[str, Any]],
+    changed_files_ok: bool,
+    changed_files_detail: str,
+    check_runs: Sequence[Mapping[str, Any]],
+    dependency_label: str,
+    high_risk_label: str,
+    dependency_bot_id: int | None,
+    required_check: str,
+    actions_app_id: int,
+) -> Decision:
+    """Return whether a dependency update pull request may be merged (dependency mode).
+
+    `files` are the pull request file entries of the API (filename, status, previous_filename,
+    patch). The AI review check is not part of this mode: only `required_check` gates the merge.
+    """
+    reasons: list[str] = []
+
+    if dependency_bot_id is None:
+        reasons.append("no dependency bot id configured")
+    elif author_type != "Bot" or author_id != dependency_bot_id:
+        reasons.append(f"author {author_login!r} is not the dependency bot")
+
+    if dependency_label == "" or dependency_label not in label_names:
+        reasons.append(f"missing label {dependency_label}")
+    if high_risk_label in label_names:
+        reasons.append(f"label {high_risk_label}")
+
+    if draft:
+        reasons.append("draft pull request")
+    if pr_base != base_branch:
+        reasons.append(f"base branch {pr_base!r} is not {base_branch!r}")
+    if head_repo_full_name != caller_repo:
+        reasons.append("head is not in this repository")
+
+    if not changed_files_ok:
+        reasons.append(changed_files_detail or "changed-file inventory incomplete")
+
+    for entry in files:
+        problem = dependency_file_problem(entry)
+        if problem is not None:
+            reasons.append(f"file {entry.get('filename')!r}: {problem}")
+    if not files:
+        reasons.append("no changed files")
+
+    ok, detail = latest_check_success(
+        check_runs, check_name=required_check, actions_app_id=actions_app_id
+    )
+    if not ok:
+        reasons.append(detail)
+
+    return Decision(enable_auto_merge=not reasons, reasons=tuple(reasons))
+
+
 def decide_from_payload(payload: Mapping[str, Any]) -> Decision:
     """Decode a JSON payload produced by the workflow step."""
     label_names = frozenset(payload.get("label_names") or ())
+    mode = str(payload.get("mode") or MODE_RISK_LOW)
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {', '.join(MODES)}")
+    if mode == MODE_DEPENDENCIES:
+        return decide_dependencies(
+            label_names=label_names,
+            draft=bool(payload.get("draft")),
+            author_login=str(payload.get("author_login") or ""),
+            author_type=str(payload.get("author_type") or ""),
+            author_id=int(payload.get("author_id") or 0),
+            base_branch=str(payload["base_branch"]),
+            pr_base=str(payload.get("pr_base") or ""),
+            head_repo_full_name=str(payload.get("head_repo") or ""),
+            caller_repo=str(payload["caller_repo"]),
+            files=tuple(payload.get("files") or ()),
+            changed_files_ok=bool(payload.get("changed_files_ok", True)),
+            changed_files_detail=str(payload.get("changed_files_detail") or ""),
+            check_runs=tuple(payload.get("check_runs") or ()),
+            dependency_label=str(payload.get("dependency_label") or ""),
+            high_risk_label=str(payload["high_risk_label"]),
+            dependency_bot_id=parse_agent_bot_id(str(payload.get("dependency_bot_id") or "")),
+            required_check=str(payload["required_check"]),
+            actions_app_id=int(payload["actions_app_id"]),
+        )
     agent_bot_raw = str(payload.get("agent_bot_id") or "")
     return decide(
         label_names=label_names,

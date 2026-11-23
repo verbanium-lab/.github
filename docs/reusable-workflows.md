@@ -988,6 +988,83 @@ when needed (optional). Offline tests cover `risk_low_automerge` path matching, 
 paths, renamed files, check-run selection and `decide`; they do not prove live auto-merge or ruleset
 behavior on the caller repository.
 
+### Dependency updates
+
+Input `mode: dependencies` (default `risk-low`) switches the decision to Renovate pull requests
+(verbanium-lab/infra#355). The risk:low rules do not apply in this mode; the merge, the pin to the
+head SHA and the requested-changes veto are the same. Every rule must hold, otherwise nothing merges:
+
+- **Author**: user id equals `dependency-bot-id` and type is `Bot` (Renovate app
+  `verbanium-lab-renovate[bot]`, id `348239511`). An empty `dependency-bot-id` denies everything.
+- **Labels**: `dependency-label` (default `deps:automerge`) is present and `risk:high` is absent.
+  Renovate sets the label itself (see below); the gate does not decide which updates are routine.
+- **Draft, base branch, head repository, file inventory**: as in risk:low (not a draft, base is
+  `base-branch`, head in this repository, the changed-file count is known, matches the list and the
+  list is not truncated; a `..` path refuses).
+- **Files**: every changed file must be on the allow-list and have status `modified` (an added,
+  removed or renamed file refuses):
+
+  | File | Rule |
+  | --- | --- |
+  | `package.json`, `**/package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` | any change |
+  | `.github/workflows/*.yml` | every added or removed line is a `uses:` line |
+  | `Dockerfile*`, `**/Dockerfile*` | every added or removed line is a `FROM` line or a `COPY --from=` line |
+
+  Any other file refuses. The line rules read the `patch` of the files API; a workflow or Dockerfile
+  entry without a patch (too large, binary) refuses, as does a patch with control characters. The
+  gate also requires the removed and added lines to pair up: for a `uses:` line only the version
+  (`@ref` and the trailing comment) may differ, so a new step or another action refuses; for a
+  `FROM` or `COPY --from=` line only the `@sha256:` digest may differ, so a tag change, a new stage or
+  a changed copy path refuses. This is stricter than "every line is a `uses:` line", on purpose.
+- **Check**: the latest `required-check` run (default `ci`) succeeded on the head SHA. The AI review
+  check is not part of this mode.
+- **Veto**: a review that requests changes stops the gate, as in risk:low.
+
+The baked-in protected-path list (`MINIMUM_PROTECTED_PATTERNS`) is **not** applied in this mode, and
+`protected-paths` and `allowed-authors` are ignored. The list names `package.json`, the lock files,
+Dockerfiles and `.github/**`, exactly the files a dependency update changes, so applying both would
+refuse every update. The allow-list replaces it and is narrower: a path outside it refuses. A
+dependency update is third-party code entering the build; the controls are the author id, the
+label rule in the Renovate config of the repository (the gate does not check who set the label),
+the line checks, green `ci` and Renovate's `minimumReleaseAge`.
+
+Caller (default branch only, same triggers and no checkout as in the risk:low example). Use a
+separate workflow file and concurrency group so it does not overlap the risk:low caller:
+
+```yaml
+jobs:
+  dependency-automerge:
+    permissions:
+      checks: read
+      contents: read
+    uses: verbanium-lab/.github/.github/workflows/risk-low-automerge.yml@REVIEWED_WORKFLOW_COMMIT
+    secrets:
+      VERBANIUM_CI_PRIVATE_KEY: ${{ secrets.VERBANIUM_CI_PRIVATE_KEY }}
+    with:
+      client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+      gate-ref: GATE_SCRIPT_COMMIT
+      pr-number: >-
+        ${{ github.event_name == 'pull_request_target' && github.event.pull_request.number ||
+            github.event.workflow_run.pull_requests[0].number }}
+      mode: dependencies
+      dependency-bot-id: "348239511"
+```
+
+Renovate side (`renovate.json` of the caller repository):
+
+- `minimumReleaseAge`: `3 days` for every update. This is the main defence against a compromised
+  release, which is usually pulled within a day or two.
+- A `packageRules` entry that adds the label `deps:automerge` only to: minor and patch updates of
+  dev tooling (`@biomejs/biome`, `vitest`, `typescript`, `@types/*`, `lefthook`, `@playwright/test`),
+  GitHub Actions updates (pinned by digest), Docker image digest updates (not tag changes) and lock
+  file maintenance. Payload, Next, the Node runtime, major updates and anything that changes what
+  runs in production get no label and stay with the owner.
+- Keep the schedule window (before 12:00 on Monday, Asia/Tbilisi).
+
+Bump `gate-ref` and `REVIEWED_WORKFLOW_COMMIT` in the caller as for risk:low. Offline tests cover the
+decision (`DependencyModeTests` in `.github/tests/test_risk_low_automerge.py`); they do not prove a
+live merge or the ruleset behaviour on the caller repository.
+
 ## Browser suites
 
 `.github/workflows/browser.yml` runs a site's Playwright suites inside the container image that
