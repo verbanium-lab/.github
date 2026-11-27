@@ -505,6 +505,17 @@ class DefaultsTests(unittest.TestCase):
             strip('f"sha={sha}"'), strip('"merge_method=squash"'), strip('ACTIONS_APP_ID = 15368'),
             strip('"conclusion") != "success"'), strip('verbanium-ci[bot]'),
             strip('release-please--branches--main'), strip('VERSION_LINE'),
+            strip('os.environ.get("RELEASE_MODE") == "on-request"'), strip('release_request(closed, repo, HEAD, contained)'),
+            strip('CHECKBOX = "- [x] Release and deploy to release-candidate after merge"'),
+            lambda w: w[True]['workflow_call']['inputs']['release-mode'].update(default='never'),
+            lambda w: w[True]['workflow_call']['inputs']['release-mode'].update(required=True),
+            lambda w: w[True]['workflow_call']['inputs'].pop('release-mode'),
+            lambda w: w['jobs']['merge']['steps'][1].pop('if'),
+            lambda w: w['jobs']['merge']['steps'][-1].pop('if'),
+            lambda w: w['jobs']['merge']['steps'][-1]['env'].pop('RELEASE_MODE'),
+            lambda w: w['jobs']['merge']['steps'][0]['env'].pop('RELEASE_MODE'),
+            lambda w: w['jobs']['merge']['steps'][0].update(
+                run=w['jobs']['merge']['steps'][0]['run'].replace('(always|on-request|never)', '.*')),
         ):
             workflow = self.reusable('merge')
             mutate(workflow)

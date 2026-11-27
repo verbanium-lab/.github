@@ -53,6 +53,7 @@ NOTIFY = embedded_python('.github/workflows/release-notify.yml', 'Validate tags 
 RETENTION = embedded_python('.github/workflows/ghcr-cleanup.yml', 'Protect the latest ten sha tags')
 AFFECTED = embedded_python('docs/reusable-workflows.md', 'Select affected images')
 RELEASE_PR = embedded_python('.github/workflows/release-pr-merge.yml', 'Check the Release PR and merge it')
+DECISION_END = '# --- end of the decision logic ---'
 
 FAKE_GH = '''#!/usr/bin/env python3
 import json, os, sys
@@ -66,6 +67,15 @@ elif args[:1] == ["api"]:
     if "/check-runs" in path:
         open(os.path.join(d, "checks.log"), "a").write(os.environ["GH_TOKEN"] + " " + path + "\\n")
         print(json.dumps([{"check_runs": json.load(open(os.path.join(d, "checks.json")))}]))
+    elif "state=closed" in path:
+        open(os.path.join(d, "closed.log"), "a").write(os.environ["GH_TOKEN"] + " " + " ".join(args) + "\\n")
+        print(json.dumps(json.load(open(os.path.join(d, "closed.json")))))
+    elif "/compare/" in path:
+        open(os.path.join(d, "compare.log"), "a").write(" ".join(args) + "\\n")
+        status = open(os.path.join(d, "compare.txt")).read()
+        if status == "error":
+            sys.exit(1)
+        print(status)
     else:
         name = "files" if "/files" in path else "pulls"
         print(json.dumps([json.load(open(os.path.join(d, name + ".json")))]))
@@ -99,6 +109,15 @@ def release_pr(**changes):
               head=dict(sha='b' * 40, repo=dict(full_name='verbanium-lab/wiki')))
     pr.update(changes)
     return pr
+
+
+TICKED_BODY = '- [x] Release and deploy to release-candidate after merge'
+
+
+def merged_pr(number, merged_at='2026-11-27T09:00:00Z', body='', merged=True, base='main', sha='c' * 40,
+              head_ref='agent/org/change', head_repo='verbanium-lab/wiki'):
+    return dict(number=number, merged_at=merged_at if merged else None, body=body, merge_commit_sha=sha,
+                base=dict(ref=base), head=dict(ref=head_ref, repo=dict(full_name=head_repo)))
 
 
 class WorkflowBehaviorTests(unittest.TestCase):
@@ -372,7 +391,8 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(values, {})
 
-    def release_merge(self, pulls, files, checks=GREEN, merge_exit=0, with_checks_log=False):
+    def release_merge(self, pulls, files, checks=GREEN, merge_exit=0, with_checks_log=False, mode='always',
+                      closed=None, compare='ahead', logs=None):
         with tempfile.TemporaryDirectory() as directory:
             d = Path(directory)
             (d / 'gh').write_text(FAKE_GH)
@@ -380,14 +400,19 @@ class WorkflowBehaviorTests(unittest.TestCase):
             (d / 'pulls.json').write_text(json.dumps(pulls))
             (d / 'files.json').write_text(json.dumps(files))
             (d / 'checks.json').write_text(json.dumps(checks))
+            (d / 'closed.json').write_text(json.dumps(closed or []))
+            (d / 'compare.txt').write_text(compare)
             if merge_exit:
                 (d / 'merge_exit').write_text(str(merge_exit))
             env = dict(PATH=f"{d}:{os.environ['PATH']}", FAKE_DIR=str(d), GITHUB_REPOSITORY='verbanium-lab/wiki',
                        GITHUB_REPOSITORY_OWNER='verbanium-lab', GITHUB_STEP_SUMMARY=str(d / 'summary'),
-                       GH_TOKEN='app-token', CHECKS_TOKEN='job-token')
+                       GH_TOKEN='app-token', CHECKS_TOKEN='job-token', RELEASE_MODE=mode)
             result = subprocess.run([sys.executable, '-c', RELEASE_PR], env=env, capture_output=True, text=True)
             log = (d / 'merge.log').read_text() if (d / 'merge.log').exists() else ''
             checks_log = (d / 'checks.log').read_text() if (d / 'checks.log').exists() else ''
+            if logs is not None:
+                for name, file in (('closed', 'closed.log'), ('compare', 'compare.log'), ('summary', 'summary')):
+                    logs[name] = (d / file).read_text() if (d / file).exists() else ''
             return (result, log, checks_log) if with_checks_log else (result, log)
 
     def test_release_pr_metadata_only_is_merged_directly_at_the_checked_head(self):
@@ -414,6 +439,212 @@ class WorkflowBehaviorTests(unittest.TestCase):
         result, log = self.release_merge([release_pr()], GOOD_FILES, merge_exit=1)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('pulls/167/merge', log)
+
+    def test_release_mode_always_is_todays_behaviour_and_reads_no_descriptions(self):
+        logs = {}
+        result, log = self.release_merge([release_pr()], GOOD_FILES, mode='always', logs=logs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pulls/167/merge', log)
+        self.assertEqual((logs['closed'], logs['compare']), ('', ''))
+
+    def test_release_mode_never_and_unknown_modes_do_not_merge(self):
+        for mode in ('never', '', 'ON-REQUEST', 'on request', 'on-request; true'):
+            with self.subTest(mode=mode):
+                result, log = self.release_merge([release_pr()], GOOD_FILES, mode=mode,
+                                                 closed=[merged_pr(1, body=TICKED_BODY)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(log, '')
+
+    def test_release_mode_on_request_merges_when_a_pull_request_ticked_the_box(self):
+        logs = {}
+        closed = [merged_pr(9, '2026-11-27T10:00:00Z', TICKED_BODY), merged_pr(8, '2026-11-27T09:00:00Z', 'No box')]
+        result, log = self.release_merge([release_pr()], GOOD_FILES, mode='on-request', closed=closed, logs=logs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log.strip(), 'app-token api --method PUT repos/verbanium-lab/wiki/pulls/167/merge '
+                         '-f merge_method=squash -f sha=' + 'b' * 40)
+        self.assertIn('state=closed&base=main&sort=updated&direction=desc&per_page=50', logs['closed'])
+        self.assertIn('compare/' + 'c' * 40 + '...' + 'b' * 40, logs['compare'])
+        self.assertIn('Release requested: pull request #9 asked for the release.', logs['summary'])
+
+    def test_release_mode_on_request_a_later_unticked_merge_does_not_cancel_the_request(self):
+        logs = {}
+        closed = [merged_pr(9, '2026-11-27T10:00:00Z', 'Fixes a typo'), merged_pr(8, '2026-11-27T09:00:00Z', TICKED_BODY)]
+        result, log = self.release_merge([release_pr()], GOOD_FILES, mode='on-request', closed=closed, logs=logs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pulls/167/merge', log)
+        self.assertIn('Release requested: pull request #8 asked for the release.', logs['summary'])
+
+    def test_release_mode_on_request_leaves_the_release_pr_to_the_owner(self):
+        for name, closed, compare in (
+            ('unticked', [merged_pr(9, body='- [ ] Release and deploy to release-candidate after merge')], 'ahead'),
+            ('no merged pull request', [], 'ahead'),
+            ('not contained', [merged_pr(9, body=TICKED_BODY)], 'diverged'),
+            ('compare failed', [merged_pr(9, body=TICKED_BODY)], 'error'),
+            ('only unticked', [merged_pr(8, '2026-11-27T09:00:00Z', 'Fixes a typo'),
+                               merged_pr(9, '2026-11-27T10:00:00Z', 'Fixes another typo')], 'ahead'),
+        ):
+            with self.subTest(name):
+                logs = {}
+                result, log = self.release_merge([release_pr()], GOOD_FILES, mode='on-request', closed=closed,
+                                                 compare=compare, logs=logs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log, '')
+                self.assertIn('left for the owner (release-mode on-request)', logs['summary'])
+
+    def test_release_mode_on_request_keeps_every_other_safety_check(self):
+        closed = [merged_pr(9, body=TICKED_BODY)]
+        code = dict(filename='portal/app/page.tsx', status='modified', patch='@@\n+x')
+        for pulls, files, checks in (
+            ([release_pr(user=dict(login='someone', type='User'))], GOOD_FILES, GREEN),
+            ([release_pr(draft=True)], GOOD_FILES, GREEN),
+            ([release_pr()], GOOD_FILES + [code], GREEN),
+            ([release_pr()], GOOD_FILES, [ci_run(conclusion='failure')]),
+            ([release_pr()], GOOD_FILES, []),
+        ):
+            with self.subTest(pr=pulls[0]['user']['login'], draft=pulls[0]['draft'], checks=checks, files=len(files)):
+                logs = {}
+                result, log = self.release_merge(pulls, files, checks=checks, mode='on-request', closed=closed, logs=logs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log, '')
+                self.assertEqual(logs['closed'], '')  # the description is read only once the rest passed
+
+    def decision(self):
+        namespace = {}
+        exec(compile(RELEASE_PR.split(DECISION_END)[0], '<decision>', 'exec'), namespace)
+        return namespace
+
+    def test_release_checkbox_counts_only_as_a_ticked_line_of_its_own(self):
+        decision = self.decision()
+        ticked = decision['ticked']
+        self.assertEqual(decision['CHECKBOX'], TICKED_BODY)
+        for name, body in (
+            ('ticked', TICKED_BODY),
+            ('upper case x', '- [X] Release and deploy to release-candidate after merge'),
+            ('star bullet', '* [x] Release and deploy to release-candidate after merge'),
+            ('crlf', 'Closes #1\r\n\r\n' + TICKED_BODY + '\r\n\r\nNone.'),
+            ('trailing space', TICKED_BODY + '  '),
+            ('after a closed comment', '<!-- hint -->\n' + TICKED_BODY),
+            ('after a closed fence', '```\ncode\n```\n' + TICKED_BODY),
+            ('after a one-line code span', '```not a fence```\n' + TICKED_BODY),
+            ('after a fence closed by a longer one', '```\n```` \n' + TICKED_BODY),
+        ):
+            with self.subTest(name):
+                self.assertTrue(ticked(body))
+        for name, body in (
+            ('unticked', '- [ ] Release and deploy to release-candidate after merge'),
+            ('other label', '- [x] Deploy to RC after merge'),
+            ('extra text', TICKED_BODY + ' please'),
+            ('prefix text', 'Note: ' + TICKED_BODY),
+            ('inline code', '`' + TICKED_BODY + '`'),
+            ('quoted', '> ' + TICKED_BODY),
+            ('indented code', '    ' + TICKED_BODY),
+            ('html comment', '<!-- ' + TICKED_BODY + ' -->'),
+            ('html comment over lines', 'Closes #1\n<!--\nTicked:\n' + TICKED_BODY + '\n-->\n- [ ] x'),
+            ('unterminated comment', '<!--\n' + TICKED_BODY),
+            ('backtick fence', '```\n' + TICKED_BODY + '\n```'),
+            ('backtick fence with language', '```md\n' + TICKED_BODY + '\n```'),
+            ('tilde fence', '~~~\n' + TICKED_BODY + '\n~~~'),
+            ('unterminated fence', 'text\n```\n' + TICKED_BODY),
+            ('closing fence must be as long', '````\n```\n' + TICKED_BODY + '\n````'),
+            ('comment swallowing a fence marker', '```\n<!--\n```\n' + TICKED_BODY),
+            ('empty', ''), ('none', None), ('number', 5),
+        ):
+            with self.subTest(name):
+                self.assertFalse(ticked(body))
+
+    def test_release_request_is_any_ticked_pull_request_in_the_release_pr(self):
+        decide = self.decision()['release_request']
+        repo, ref = 'verbanium-lab/wiki', 'release-please--branches--main'
+        older, newer = '2026-11-26T10:00:00Z', '2026-11-27T10:00:00Z'
+
+        def run(closed, contained=lambda sha: True):
+            return decide(closed, repo, ref, contained)
+
+        self.assertTrue(run([merged_pr(5, older, TICKED_BODY)])[0])
+        self.assertFalse(run([merged_pr(5, older, 'plain')])[0])
+        # Ticked, then unticked: the later merge does not cancel the request, whatever the API order is.
+        ticked_old, plain_new = merged_pr(5, older, TICKED_BODY), merged_pr(6, newer, 'plain')
+        for closed in ([ticked_old, plain_new], [plain_new, ticked_old]):
+            requested, reason = run(closed)
+            self.assertTrue(requested)
+            self.assertIn('#5 asked for the release', reason)
+        # Unticked only: no request.
+        plain_old = merged_pr(5, older, 'plain')
+        self.assertFalse(run([plain_old, plain_new])[0])
+        plain_old, ticked_new = merged_pr(5, older, 'plain'), merged_pr(6, newer, TICKED_BODY)
+        for closed in ([plain_old, ticked_new], [ticked_new, plain_old]):
+            requested, reason = run(closed)
+            self.assertTrue(requested)
+            self.assertIn('#6 asked for the release', reason)
+        # Ticked but not contained in the Release PR head: no request.
+        requested, reason = run([merged_pr(5, older, TICKED_BODY)], lambda sha: False)
+        self.assertFalse(requested)
+        self.assertIn('#5', reason)
+        self.assertIn('not in the Release PR head yet', reason)
+        # Two ticked, the older contained and the newer not: released, and the contained one is named.
+        old_sha, new_sha = 'a' * 40, 'd' * 40
+        two = [merged_pr(5, older, TICKED_BODY, sha=old_sha), merged_pr(6, newer, TICKED_BODY, sha=new_sha),
+               merged_pr(7, newer, 'plain')]
+        seen = []
+        requested, reason = run(two, lambda sha: seen.append(sha) or sha == old_sha)
+        self.assertTrue(requested)
+        self.assertIn('#5 asked for the release', reason)
+        self.assertNotIn('#6', reason)
+        self.assertEqual(seen, [new_sha, old_sha])  # newest ticked first, stop at the first contained
+        # Only ticked pull requests are checked for containment; the first contained one stops the search.
+        seen = []
+        self.assertTrue(run(two, lambda sha: seen.append(sha) or True)[0])
+        self.assertEqual(seen, [new_sha])
+        seen = []
+        self.assertFalse(run([merged_pr(5, older, 'plain', sha=old_sha)], lambda sha: seen.append(sha) or True)[0])
+        self.assertEqual(seen, [])
+        # No merged pull request that can be in the Release PR.
+        self.assertFalse(run([])[0])
+        self.assertFalse(run([merged_pr(5, older, TICKED_BODY, merged=False)])[0])
+        self.assertFalse(run([merged_pr(5, older, TICKED_BODY, base='next')])[0])
+        self.assertFalse(run([merged_pr(5, older, TICKED_BODY, sha='unknown')])[0])
+        # Pull requests merged before the last release are already released; Release PRs never count.
+        previous = merged_pr(7, newer, TICKED_BODY, head_ref=ref)
+        self.assertFalse(run([previous, merged_pr(5, older, TICKED_BODY)])[0])
+        self.assertTrue(run([previous, merged_pr(8, '2026-11-27T11:00:00Z', TICKED_BODY)])[0])
+        self.assertFalse(run([previous])[0])
+        # A fork branch with the Release PR's name is an ordinary pull request.
+        self.assertTrue(run([merged_pr(9, newer, TICKED_BODY, head_ref=ref, head_repo='someone/wiki')])[0])
+        # The merge commit has to be in the Release PR head; the check sees exactly that commit.
+        seen = []
+        self.assertFalse(run([merged_pr(5, older, TICKED_BODY)], lambda sha: seen.append(sha) or False)[0])
+        self.assertEqual(seen, ['c' * 40])
+
+    def test_release_request_fails_closed_when_the_closed_page_is_incomplete(self):
+        decide = self.decision()['release_request']
+        repo, ref = 'verbanium-lab/wiki', 'release-please--branches--main'
+        page = decide.__globals__['CLOSED_PAGE']
+        self.assertEqual(page, 50)
+        fill = lambda n, **changes: [merged_pr(100 + i, '2026-11-20T10:00:00Z', 'plain', **changes) for i in range(n)]
+        incomplete = 'window is incomplete'
+        ticked_new = merged_pr(5, '2026-11-27T10:00:00Z', TICKED_BODY)
+        # A full page without a Release PR: never a request, even with a ticked, contained pull request.
+        for closed in (fill(page), fill(page, merged=False), fill(page - 1) + [ticked_new],
+                       fill(page - 1, merged=False) + [ticked_new]):
+            with self.subTest(size=len(closed)):
+                requested, reason = decide(closed, repo, ref, lambda sha: True)
+                self.assertFalse(requested)
+                self.assertIn(incomplete, reason)
+        # A short page, or a full page that holds a Release PR, is complete and decides as before.
+        release = merged_pr(7, '2026-11-26T10:00:00Z', TICKED_BODY, head_ref=ref)
+        for closed in (fill(page - 2) + [ticked_new], fill(page - 2) + [release, ticked_new]):
+            with self.subTest(size=len(closed)):
+                requested, reason = decide(closed, repo, ref, lambda sha: True)
+                self.assertTrue(requested)
+                self.assertNotIn(incomplete, reason)
+
+    def test_release_mode_on_request_summary_names_the_full_page(self):
+        logs = {}
+        closed = [merged_pr(100 + i, '2026-11-20T10:00:00Z', 'plain') for i in range(50)]
+        result, log = self.release_merge([release_pr()], GOOD_FILES, mode='on-request', closed=closed, logs=logs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log, '')
+        self.assertIn('the window is incomplete', logs['summary'])
 
     def test_release_pr_absent_or_ambiguous_is_left_alone(self):
         for pulls in ([], [release_pr(), release_pr(number=168)]):
