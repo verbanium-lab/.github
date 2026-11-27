@@ -849,14 +849,34 @@ for a Release PR that would be refused anyway):
    newest first, and the search stops at the first contained one; the run summary names that pull
    request. A pull request merged after release-please last updated the Release PR is not in it
    yet; the next CI run on the updated PR decides.
-4. The page is not paginated. When it is full (50 entries) and holds no merged Release PR, the last
-   release is unknown and older pull requests could be missing: `on-request` fails closed, does not
-   merge and leaves the Release PR for the owner; the run summary gives that reason.
+4. The page is not paginated, so a full page (50 entries) may have dropped pull requests. A full page
+   decides only when it provably reaches back past the last release: the oldest `updated_at` on it is
+   earlier than the merge time of the newest Release PR on it. A pull request merged after the last
+   release has `updated_at` at or after its merge time, so then every one of them (and the newest
+   Release PR) is on the page. Otherwise, including a full page with no merged Release PR,
+   `on-request` fails closed, does not merge and leaves the Release PR for the owner; the run summary
+   says the window is incomplete. Equal times count as not earlier. A page entry without an
+   `updated_at` also fails closed. A short page (under 50 entries) is complete.
 
 The description is read through the API as JSON and matched by a regular expression in Python. It is
-never executed, never put into a shell line or an expression, and never written to an output. A
-description edited after the merge counts as edited: only people who can edit the pull request can
-tick the box, which is the same group that could merge it into `main`.
+never executed, never put into a shell line or an expression, and never written to an output. Lines
+end only at CRLF, CR or LF; U+2028, U+2029, form feed and the like do not start a new line.
+
+The description counts as it is when the job runs, not as it was at merge time. The people who can
+tick the box are everyone who can edit the pull request description: its author (who can still edit
+it after the merge) and anyone with write access. Ticking the box therefore asks for a release,
+whoever merged the pull request.
+
+Behaviour to know:
+
+- An unset variable passed as `release-mode` (`release-mode: ${{ vars.RELEASE_MODE }}`) arrives as an
+  empty string, which is not one of the three modes: the job fails. Omit the input to get `always`.
+- A ticked pull request that was later reverted still releases: the box counts, not the content of
+  `main`. Untick the box in its description, or merge the Release PR by hand, if that is not wanted.
+- With `never` the job still starts and enters its `production` environment (and its approval rules,
+  if any); it only skips minting the token and everything after it.
+- A ticked pull request waits until release-please next updates the Release PR to include it. The
+  check that decides runs on that update (and again when its CI ends), not at the moment of ticking.
 
 Dry run of the decision against real pull requests (no merge, no token beyond a read-only login):
 read the closed pull requests and the Release PR head with `gh api`, then call
@@ -897,9 +917,9 @@ behind the environment branch rule, and this workflow checks the PR shape before
 Risk of `on-request`: a ticked box in **any** pull request merged since the last release releases
 everything on `main` up to the Release PR head, including later pull requests that did not tick it.
 That is the intent (a release is a batch), and the Release PR carries only release metadata. When the
-page of closed pull requests is full and holds no Release PR, an already released pull request with
-the box ticked could be taken for a fresh one, so `on-request` does not merge then; the owner merges
-the Release PR by hand.
+page of closed pull requests is full and does not reach back past the last release, an already
+released pull request with the box ticked could be taken for a fresh one, so `on-request` does not
+merge then; the owner merges the Release PR by hand.
 
 
 ## Risk low auto-merge

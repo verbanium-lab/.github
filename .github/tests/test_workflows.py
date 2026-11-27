@@ -25,6 +25,15 @@ def embedded_python(path, step):
     return textwrap.dedent(match[2])
 
 
+def embedded_shell(path, step):
+    """Extract the `run: |` block of one step; the step's shell is bash (workflow defaults)."""
+    text = (ROOT / path).read_text().split(f'- name: {step}\n', 1)[1]
+    match = re.search(r'(?m)^( +)run: \|\n((?:\1 +.*\n|\n)+)', text)
+    if not match:
+        raise AssertionError('run block not found')
+    return textwrap.dedent(match[2])
+
+
 def github_output(text):
     """Parse GITHUB_OUTPUT the way the runner does: name=value and name<<DELIMITER blocks."""
     values, lines = {}, iter(text.splitlines())
@@ -53,6 +62,7 @@ NOTIFY = embedded_python('.github/workflows/release-notify.yml', 'Validate tags 
 RETENTION = embedded_python('.github/workflows/ghcr-cleanup.yml', 'Protect the latest ten sha tags')
 AFFECTED = embedded_python('docs/reusable-workflows.md', 'Select affected images')
 RELEASE_PR = embedded_python('.github/workflows/release-pr-merge.yml', 'Check the Release PR and merge it')
+RELEASE_PR_PLAN = embedded_shell('.github/workflows/release-pr-merge.yml', 'Check event boundary')
 DECISION_END = '# --- end of the decision logic ---'
 
 FAKE_GH = '''#!/usr/bin/env python3
@@ -115,8 +125,10 @@ TICKED_BODY = '- [x] Release and deploy to release-candidate after merge'
 
 
 def merged_pr(number, merged_at='2026-11-27T09:00:00Z', body='', merged=True, base='main', sha='c' * 40,
-              head_ref='agent/org/change', head_repo='verbanium-lab/wiki'):
-    return dict(number=number, merged_at=merged_at if merged else None, body=body, merge_commit_sha=sha,
+              head_ref='agent/org/change', head_repo='verbanium-lab/wiki', updated_at=None):
+    """A closed pull request as the list API returns it; updated_at defaults to the close time."""
+    return dict(number=number, merged_at=merged_at if merged else None, updated_at=updated_at or merged_at,
+                body=body, merge_commit_sha=sha,
                 base=dict(ref=base), head=dict(ref=head_ref, repo=dict(full_name=head_repo)))
 
 
@@ -527,6 +539,8 @@ class WorkflowBehaviorTests(unittest.TestCase):
             ('after a closed fence', '```\ncode\n```\n' + TICKED_BODY),
             ('after a one-line code span', '```not a fence```\n' + TICKED_BODY),
             ('after a fence closed by a longer one', '```\n```` \n' + TICKED_BODY),
+            ('after a text with a line separator', 'a b\x0cc\x85d\n' + TICKED_BODY),
+            ('lone CR', 'Closes #1\r' + TICKED_BODY + '\rNone.'),
         ):
             with self.subTest(name):
                 self.assertTrue(ticked(body))
@@ -547,6 +561,13 @@ class WorkflowBehaviorTests(unittest.TestCase):
             ('unterminated fence', 'text\n```\n' + TICKED_BODY),
             ('closing fence must be as long', '````\n```\n' + TICKED_BODY + '\n````'),
             ('comment swallowing a fence marker', '```\n<!--\n```\n' + TICKED_BODY),
+            # str.splitlines would split on these and let the text after them count as a line of its own.
+            ('after U+2028', 'x ' + TICKED_BODY),
+            ('before U+2028', TICKED_BODY + ' more'),
+            ('after U+2029', 'x ' + TICKED_BODY),
+            ('after a form feed', 'x\x0c' + TICKED_BODY),
+            ('after U+0085', 'x\x85' + TICKED_BODY),
+            ('after a vertical tab', 'x\x0b' + TICKED_BODY),
             ('empty', ''), ('none', None), ('number', 5),
         ):
             with self.subTest(name):
@@ -630,13 +651,133 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 requested, reason = decide(closed, repo, ref, lambda sha: True)
                 self.assertFalse(requested)
                 self.assertIn(incomplete, reason)
-        # A short page, or a full page that holds a Release PR, is complete and decides as before.
+        # A short page decides as before, and so does a full page that provably reaches back past the last
+        # release: its oldest updated_at (2026-11-20) is earlier than the Release PR's merge (2026-11-26).
         release = merged_pr(7, '2026-11-26T10:00:00Z', TICKED_BODY, head_ref=ref)
         for closed in (fill(page - 2) + [ticked_new], fill(page - 2) + [release, ticked_new]):
             with self.subTest(size=len(closed)):
                 requested, reason = decide(closed, repo, ref, lambda sha: True)
                 self.assertTrue(requested)
                 self.assertNotIn(incomplete, reason)
+        # The same full page without the fresh ticked pull request decides too (no request, and not "incomplete").
+        requested, reason = decide(fill(page - 1) + [release], repo, ref, lambda sha: True)
+        self.assertFalse(requested)
+        self.assertNotIn(incomplete, reason)
+
+    def probe_page(self, tick_updated_at='2026-11-25T10:00:00Z', release_updated_at='2026-11-25T10:00:00Z'):
+        """The reviewer's probe: R1 (the last release, merged 2026-11-20) fell off a full page, which still holds
+        an older Release PR R0 that was touched and a ticked pull request merged between R0 and R1."""
+        ref = 'release-please--branches--main'
+        plain = [merged_pr(100 + i, '2026-11-24T10:00:00Z', 'plain') for i in range(48)]
+        r0 = merged_pr(50, '2026-11-10T10:00:00Z', head_ref=ref, updated_at=release_updated_at)
+        released = merged_pr(60, '2026-11-15T10:00:00Z', TICKED_BODY, updated_at=tick_updated_at)
+        return plain + [r0, released]
+
+    def test_release_request_refuses_a_full_page_that_does_not_reach_back_past_the_last_release(self):
+        decide = self.decision()['release_request']
+        repo, ref = 'verbanium-lab/wiki', 'release-please--branches--main'
+        incomplete = 'window is incomplete'
+        for order in (lambda page: page, lambda page: page[::-1]):
+            with self.subTest('probe'):
+                closed = order(self.probe_page())
+                self.assertEqual(len(closed), 50)
+                requested, reason = decide(closed, repo, ref, lambda sha: True)
+                self.assertFalse(requested)
+                self.assertIn(incomplete, reason)
+        # Equal timestamps are not "earlier": the oldest update is the Release PR's own merge time.
+        at = '2026-11-26T10:00:00Z'
+        plain = lambda n, updated: [merged_pr(100 + i, '2026-11-20T10:00:00Z', 'plain', updated_at=updated) for i in range(n)]
+        release = merged_pr(7, at, head_ref=ref, updated_at=at)
+        requested, reason = decide(plain(49, at) + [release], repo, ref, lambda sha: True)
+        self.assertFalse(requested)
+        self.assertIn(incomplete, reason)
+        # One second earlier is enough to prove the page complete.
+        fresh = merged_pr(8, '2026-11-27T10:00:00Z', TICKED_BODY)
+        self.assertTrue(decide(plain(48, '2026-11-26T09:59:59Z') + [release, fresh], repo, ref, lambda sha: True)[0])
+        # One entry without a usable updated_at leaves the oldest update unknown: fail closed.
+        for name, value in (('missing', 'del'), ('none', None), ('empty', '')):
+            with self.subTest(name):
+                page = plain(48, '2026-11-20T10:00:00Z') + [release, fresh]
+                if value == 'del':
+                    del page[0]['updated_at']
+                else:
+                    page[0]['updated_at'] = value
+                requested, reason = decide(page, repo, ref, lambda sha: True)
+                self.assertFalse(requested)
+                self.assertIn(incomplete, reason)
+
+    def test_release_mode_on_request_refuses_the_probe_page_end_to_end(self):
+        logs = {}
+        result, log = self.release_merge([release_pr()], GOOD_FILES, mode='on-request', closed=self.probe_page(), logs=logs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(log, '')
+        self.assertEqual(logs['compare'], '')  # refused before any containment check
+        self.assertIn('the window is incomplete', logs['summary'])
+
+    def test_release_mode_on_request_end_to_end_edge_cases(self):
+        ref = 'release-please--branches--main'
+        released_at, later = '2026-11-26T10:00:00Z', '2026-11-27T10:00:00Z'
+        for name, closed, compare, merges in (
+            ('compare behind', [merged_pr(9, later, TICKED_BODY)], 'behind', False),
+            ('compare identical', [merged_pr(9, later, TICKED_BODY)], 'identical', True),
+            ('compare ahead', [merged_pr(9, later, TICKED_BODY)], 'ahead', True),
+            # A Release PR closed without merge marks no release, and never asks for one itself.
+            ('release closed without merge', [merged_pr(8, released_at, TICKED_BODY, merged=False, head_ref=ref),
+                                              merged_pr(9, later, TICKED_BODY)], 'ahead', True),
+            ('only a release closed without merge', [merged_pr(8, released_at, TICKED_BODY, merged=False, head_ref=ref)],
+             'ahead', False),
+            # A pull request merged in the same second as the last Release PR counts as released (fail closed).
+            ('equal timestamps', [merged_pr(7, released_at, head_ref=ref), merged_pr(9, released_at, TICKED_BODY)],
+             'ahead', False),
+            ('later by a second', [merged_pr(7, released_at, head_ref=ref),
+                                   merged_pr(9, '2026-11-26T10:00:01Z', TICKED_BODY)], 'ahead', True),
+        ):
+            with self.subTest(name):
+                logs = {}
+                result, log = self.release_merge([release_pr()], GOOD_FILES, mode='on-request', closed=closed,
+                                                 compare=compare, logs=logs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual('pulls/167/merge' in log, merges, logs['summary'])
+                self.assertIn('Release requested' if merges else 'left for the owner (release-mode on-request)',
+                              logs['summary'])
+
+    def release_plan(self, mode, event='push', ref='refs/heads/main', client_id='Iv1.0123456789abcdef'):
+        with tempfile.TemporaryDirectory() as directory:
+            d = Path(directory)
+            env = dict(PATH=os.environ['PATH'], GITHUB_EVENT_NAME=event, GITHUB_REF=ref, CLIENT_ID=client_id,
+                       RELEASE_MODE=mode, GITHUB_OUTPUT=str(d / 'output'), GITHUB_STEP_SUMMARY=str(d / 'summary'))
+            result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', RELEASE_PR_PLAN], env=env,
+                                    capture_output=True, text=True)
+            values = github_output((d / 'output').read_text()) if (d / 'output').exists() else {}
+            summary = (d / 'summary').read_text() if (d / 'summary').exists() else ''
+            return result, values, summary
+
+    def test_release_pr_plan_step_accepts_only_the_three_modes(self):
+        for mode in ('always', 'on-request', 'never'):
+            with self.subTest(mode):
+                result, values, summary = self.release_plan(mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(values, {'client-id': 'Iv1.0123456789abcdef', 'release-mode': mode})
+                self.assertEqual('Release PR merge is off' in summary, mode == 'never')
+        for name, mode in (('empty', ''), ('newline', 'always\nnever'), ('newline output injection', 'never\nrelease-mode=always'),
+                           ('trailing newline', 'always\n'), ('upper case', 'NEVER'), ('space', 'on request'),
+                           ('prefix', 'xalways'), ('suffix', 'neverx'), ('command', 'always; true')):
+            with self.subTest(name):
+                result, values, summary = self.release_plan(mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('release-mode must be', result.stdout)
+                self.assertEqual((values, summary), ({}, ''))  # nothing reaches the outputs
+
+    def test_release_pr_plan_step_keeps_the_event_and_client_boundary(self):
+        for name, changes in (('pull_request', dict(event='pull_request')), ('branch', dict(ref='refs/heads/feature')),
+                              ('client id', dict(client_id='not-a-client-id'))):
+            with self.subTest(name):
+                result, values, _ = self.release_plan('always', **changes)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(values, {})
+        for event in ('push', 'workflow_run'):
+            with self.subTest(event):
+                self.assertEqual(self.release_plan('always', event=event)[0].returncode, 0)
 
     def test_release_mode_on_request_summary_names_the_full_page(self):
         logs = {}

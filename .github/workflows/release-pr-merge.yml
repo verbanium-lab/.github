@@ -131,7 +131,8 @@ jobs:
               if not isinstance(body, str):
                   return False
               fence = ""
-              for line in COMMENT.sub("", body).splitlines():
+              # Only CRLF, CR and LF end a line here; str.splitlines also splits on U+2028, form feed and more.
+              for line in re.split(r"\r\n|\r|\n", COMMENT.sub("", body)):
                   opening = FENCE.match(line)
                   if opening and opening[1][0] == "`" and "`" in opening[2]:
                       opening = None  # a code span on one line, not a fence
@@ -152,8 +153,13 @@ jobs:
               Only pull requests merged after the last merged Release PR can be in the open one. Any
               of them with the box ticked asks for the release, provided its merge commit is in the
               Release PR head; the newest ticked one is checked first and the first contained one is
-              named. A later pull request without the box does not cancel the request. A full page
-              without a merged Release PR leaves the last release unknown: no request (fail closed).
+              named. A later pull request without the box does not cancel the request.
+
+              A full page may have dropped pull requests, so it decides only when it provably reaches
+              back past the last release: its oldest `updated_at` is earlier than `since`. A fresh
+              pull request has updated_at >= merged_at > since, so then every one of them is on the
+              page (and so is the newest Release PR). Otherwise, or with no merged Release PR at all
+              (`since` is empty), the window is incomplete: no request (fail closed).
               """
               merged = [p for p in closed if p.get("merged_at") and (p.get("base") or {}).get("ref") == "main"]
               def release_pr(p):
@@ -162,9 +168,12 @@ jobs:
               releases = [p["merged_at"] for p in merged if release_pr(p)]
               since = max(releases, default="")
               fresh = [p for p in merged if not release_pr(p) and p["merged_at"] > since]
-              if len(closed) >= CLOSED_PAGE and not releases:
-                  return False, (f"the page of {CLOSED_PAGE} closed pull requests is full and has no Release PR, "
-                                 "so the last release is unknown and the window is incomplete")
+              if len(closed) >= CLOSED_PAGE:
+                  oldest = min((p.get("updated_at") or "" for p in closed), default="")  # missing: "" never passes
+                  if not oldest or oldest >= since:
+                      return False, (f"the page of {CLOSED_PAGE} closed pull requests is full and does not reach back "
+                                     "past the last release, so the last release or older pull requests may be "
+                                     "missing and the window is incomplete")
               if not fresh:
                   return False, "no pull request merged into main since the last release"
               asked = sorted((p for p in fresh if ticked(p.get("body"))),
