@@ -799,6 +799,71 @@ jobs:
       client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
 ```
 
+### Release modes
+
+Input `release-mode` (string, optional) decides **when** the Release PR is merged. Owner decision
+2026-11-27 (infra#412): a release is a batch by default and happens on request.
+
+| Mode | The job merges the Release PR |
+| --- | --- |
+| `always` (input default) | whenever the checks below pass: today's behaviour. A caller that does not set the input, or that is pinned to a commit from before this input existed, keeps it |
+| `on-request` | only when **any** pull request merged into `main` since the last Release PR has the line `- [x] Release and deploy to release-candidate after merge` ticked in its description and its merge commit is contained in the Release PR head; otherwise the Release PR waits for the owner |
+| `never` | never: the job writes one line to the run summary and does nothing (no App token is minted); the owner merges every Release PR |
+
+An unknown value fails the job before the App token is minted. The input is checked and read only in
+the first step, through `env`.
+
+A repository opts in to the owner's batch default by moving its pin to a commit that has the input
+and adding it to **both** callers (`release.yml` and `release-pr-merge.yml`):
+
+```yaml
+    with:
+      client-id: ${{ vars.VERBANIUM_CI_CLIENT_ID }}
+      release-mode: on-request
+```
+
+The same change adds the line to the repository's pull request template, unticked, next to a
+comment that says what ticking does (the constant is exactly this text, case and spelling included):
+
+```markdown
+- [ ] Release and deploy to release-candidate after merge
+```
+
+How `on-request` decides, after every check below has passed (so the description is not even read
+for a Release PR that would be refused anyway):
+
+1. It reads one page of the 50 most recently updated closed pull requests into `main` through the API
+   and keeps the merged ones. The Release PR branch `release-please--branches--main` of this repository
+   is never a candidate; its newest merged pull request marks the last release, and only pull requests
+   merged after it can be in the open Release PR. A direct push to `main` is not a pull request and
+   cannot ask for a release. No such pull request: the Release PR waits.
+2. Of those, the ones whose description has the ticked line on a line of its own ask for the release:
+   `- [x]` (or `* [x]`, `[X]`) followed by the exact text, nothing before or after it. Lines inside an
+   HTML comment (also an unterminated one), inside a fenced code block (``` or ~~~), inside an
+   indented code block, in a quote or in inline code do not count. This is what keeps the template's
+   own hint comment, which may quote the line, from ticking it. **Any** such pull request is enough:
+   a later merge without the box does not cancel the request, because a release ships everything on
+   `main` (owner decision, infra#416).
+3. The merge commit of a pull request that asked must be contained in the Release PR head
+   (`compare/<merge commit>...<head>` is `ahead` or `identical`). Only the ticked ones are checked,
+   newest first, and the search stops at the first contained one; the run summary names that pull
+   request. A pull request merged after release-please last updated the Release PR is not in it
+   yet; the next CI run on the updated PR decides.
+4. The page is not paginated. When it is full (50 entries) and holds no merged Release PR, the last
+   release is unknown and older pull requests could be missing: `on-request` fails closed, does not
+   merge and leaves the Release PR for the owner; the run summary gives that reason.
+
+The description is read through the API as JSON and matched by a regular expression in Python. It is
+never executed, never put into a shell line or an expression, and never written to an output. A
+description edited after the merge counts as edited: only people who can edit the pull request can
+tick the box, which is the same group that could merge it into `main`.
+
+Dry run of the decision against real pull requests (no merge, no token beyond a read-only login):
+read the closed pull requests and the Release PR head with `gh api`, then call
+`release_request(closed, repo, "release-please--branches--main", contained)` from the part of the
+embedded script above the line `# --- end of the decision logic ---`; the unit tests in
+`.github/tests/test_workflows.py` load it the same way.
+
 It merges the PR (squash, through the REST merge endpoint with `sha=<checked head>`) only when all
 hold:
 
@@ -811,7 +876,8 @@ hold:
   is a version (`"version": "…"`, a manifest `"<path>": "<semver>"` entry, or a bare semver);
 - the required `ci` check run from GitHub Actions on exactly that head SHA is completed with
   `success` (read with the job token, `checks: read`; the App token is used only for the merge).
-  While `ci` is still running it exits quietly; the `workflow_run` caller retries when CI ends.
+  While `ci` is still running it exits quietly; the `workflow_run` caller retries when CI ends;
+- in `on-request` mode, the release was requested as described above.
 
 GitHub auto-merge is not used: it does not apply the App's ruleset bypass, so a Release PR with
 auto-merge on stays `BLOCKED` waiting for an approval (verbanium-templates#79). A direct merge by
@@ -827,6 +893,13 @@ Risk: whoever holds the verbanium-ci private key (an organization secret used on
 jobs in `production` environments) could merge any open PR whose checks pass, without approval.
 Mitigations: the key never leaves GitHub Actions secrets, the jobs that read it run only on `main`
 behind the environment branch rule, and this workflow checks the PR shape before merging.
+
+Risk of `on-request`: a ticked box in **any** pull request merged since the last release releases
+everything on `main` up to the Release PR head, including later pull requests that did not tick it.
+That is the intent (a release is a batch), and the Release PR carries only release metadata. When the
+page of closed pull requests is full and holds no Release PR, an already released pull request with
+the box ticked could be taken for a fresh one, so `on-request` does not merge then; the owner merges
+the Release PR by hand.
 
 
 ## Risk low auto-merge

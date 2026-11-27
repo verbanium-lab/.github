@@ -600,16 +600,22 @@ def validate_reusable(workflow, kind):
         require(set(secrets) == {"VERBANIUM_CI_PRIVATE_KEY"} and secrets["VERBANIUM_CI_PRIVATE_KEY"].get("required") is True,
                 "the verbanium-ci key is the only secret")
         declared = call.get("inputs", {})
-        require(set(declared) == {"client-id"} and declared["client-id"].get("type") == "string"
-                and declared["client-id"].get("required") is True, "client-id input only")
+        require(set(declared) == {"client-id", "release-mode"} and declared["client-id"].get("type") == "string"
+                and declared["client-id"].get("required") is True, "client-id and release-mode inputs only")
+        mode = declared["release-mode"]
+        require(mode.get("type") == "string" and mode.get("default") == "always" and not mode.get("required"),
+                "optional release-mode input that defaults to always (callers on older pins keep merging)")
         job = jobs["merge"]
         require(job.get("permissions") == {"checks": "read"} and "needs" not in job and "if" not in job,
                 "merge job token reads checks only (the merge uses the App token) and always runs")
         require(job.get("environment") == {"name": "production", "deployment": False},
                 "the App key stays behind the production environment")
         steps = job.get("steps", [])
-        require(steps and steps[0].get("id") == "plan" and steps[0].get("env") == {"CLIENT_ID": "${{ inputs.client-id }}"},
-                "validation must run first and read client-id through env")
+        require(steps and steps[0].get("id") == "plan" and steps[0].get("env") == {
+                "CLIENT_ID": "${{ inputs.client-id }}", "RELEASE_MODE": "${{ inputs.release-mode }}"},
+                "validation must run first and read client-id and release-mode through env")
+        require('[[ "$RELEASE_MODE" =~ ^(always|on-request|never)$ ]]' in steps[0].get("run", ""),
+                "release-mode must be validated against its three values")
         require('("$GITHUB_EVENT_NAME" == push || "$GITHUB_EVENT_NAME" == workflow_run) && "$GITHUB_REF" == refs/heads/main'
                 in steps[0].get("run", ""), "main pushes or CI workflow_run on main only")
         for step in steps[1:]:
@@ -620,13 +626,18 @@ def validate_reusable(workflow, kind):
         run = " ".join(s.get("run", "") for s in steps)
         for needle in ("release-please--branches--main", "verbanium-ci[bot]", '"merge_method=squash"', 'f"sha={sha}"',
                        'REQUIRED_CHECK = "ci"', "ACTIONS_APP_ID = 15368", '"conclusion") != "success"',
-                       "MANIFEST_LINE", "VERSION_LINE"):
+                       "MANIFEST_LINE", "VERSION_LINE",
+                       'CHECKBOX = "- [x] Release and deploy to release-candidate after merge"',
+                       'os.environ.get("RELEASE_MODE") == "on-request"', "release_request(closed, repo, HEAD, contained)"):
             require(needle in run, "release PR guard required: " + needle)
+        off = "${{ steps.plan.outputs.release-mode != 'never' }}"
+        require(all(s.get("if") == off for s in steps[1:]), "release-mode never must skip token and merge")
         require("gh pr review" not in run and "--admin" not in run and "--auto" not in run,
                 "no approvals, admin merges or auto-merge (auto-merge does not apply the ruleset bypass)")
         merge_step = steps[-1]
-        require(merge_step.get("env") == {"GH_TOKEN": "${{ steps.app.outputs.token }}", "CHECKS_TOKEN": "${{ github.token }}"},
-                "App token for the merge, job token only for reading checks")
+        require(merge_step.get("env") == {"GH_TOKEN": "${{ steps.app.outputs.token }}", "CHECKS_TOKEN": "${{ github.token }}",
+                                          "RELEASE_MODE": "${{ steps.plan.outputs.release-mode }}"},
+                "App token for the merge, job token only for reading checks, the validated release mode")
     elif kind == "automerge":
         require(set(jobs) == {"gate"}, "one gate job required")
         secrets = call.get("secrets", {})
