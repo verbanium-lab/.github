@@ -667,7 +667,7 @@ amendment 2026-10-28; .github#25). Its three jobs:
 
 | Job | Permissions | What it does |
 | --- | --- | --- |
-| `plan` | none | Validates every input against the run: main push, `image-tags` is `<image>:sha-<this commit>`, `sha7` is this commit, the digest, the Coolify UUID, https `verbanium.dev` URLs, the environment and the App client ID. Later jobs read only its outputs. |
+| `plan` | none | Validates every input against the run: main push, `image-tags` is `<image>:sha-<this commit>`, `sha7` is this commit, the digest, the Coolify UUID, https URLs under `verbanium.dev` or `iblonda.tv` (product domains on the allowlist), the environment and the App client ID. Later jobs read only its outputs. |
 | `record` | none (App token) | Creates the GitHub Deployment with the verbanium-ci App in the caller's environment (`deployment: false`). |
 | `deploy` | `contents: read`, `id-token: write`, `packages: write` | Fails first if a deploy secret is empty, then joins the tailnet as an ephemeral `tag:ci` node (Tailscale workload identity), sets `sha256-<hex>` as the Coolify image tag, deploys, waits up to 10 minutes for Coolify, then up to 5 minutes for `verify-url` to report `sha7`. After live verification, moves `deployed-<env>` to the deployed digest and verifies the tag. Deploy and retag share the app/environment lock (`cancel-in-progress: false`). |
 

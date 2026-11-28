@@ -171,9 +171,9 @@ jobs:
           [[ "$SHA7" == "${GITHUB_SHA::7}" ]] || fail "build sha7 does not match the commit"
           [[ -z "$BUILD_NUMBER" || "$BUILD_NUMBER" =~ ^[1-9][0-9]{0,8}$ ]] || fail "invalid build number"
           [[ "$APP_UUID" =~ ^[a-z0-9]{20,32}$ ]] || fail "invalid Coolify application UUID (repository variable not set?)"
-          url_re='^https://([a-z0-9-]+\.)*verbanium\.dev(/[A-Za-z0-9._~/-]*)?$'
-          [[ "$SITE_URL" =~ $url_re ]] || fail "site-url must be an https verbanium.dev URL"
-          [[ "$VERIFY_URL" =~ $url_re ]] || fail "verify-url must be an https verbanium.dev URL"
+          url_re='^https://([a-z0-9-]+\.)*(verbanium\.dev|iblonda\.tv)(/[A-Za-z0-9._~/-]*)?$'
+          [[ "$SITE_URL" =~ $url_re ]] || fail "site-url must be an https URL under verbanium.dev or iblonda.tv"
+          [[ "$VERIFY_URL" =~ $url_re ]] || fail "verify-url must be an https URL under verbanium.dev or iblonda.tv"
           [[ -z "$VERIFY_FIELD" || "$VERIFY_FIELD" =~ ^[a-z][a-zA-Z0-9_]{0,30}$ ]] || fail "invalid verify-json-field"
           [[ "$TARGET_ENV" =~ ^(production|release-candidate|dev)$ ]] || fail "unknown environment"
           [[ "$TAG_ENV" =~ ^(dev|rc|prod)$ ]] || fail "env must be dev, rc or prod"
